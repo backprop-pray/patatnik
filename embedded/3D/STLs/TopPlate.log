@@ -1,0 +1,28 @@
+Solid Edge Translation to STL
+Date: Thursday,March 26,2026 01:01PM
+Source File:D:\Projects\patatnik\embedded\3D\Pars\TopPlate.par
+Source System: SOLID EDGE
+
+Hardware:
+Processor: 13th Gen Intel(R) Core(TM) i7-13800H
+Operating System: Windows 10 Professional
+Installed Memory: 63.6 GB
+
+Software Information:
+Parasolid Version: 37.0.118
+PSBodyshop Version: 37.0.94
+STL Adapter Version: 15.0.142
+Solid Edge Version: 225.00.00.114 x64
+
+STL Export Options:
+Output File Format:BINARY
+Export Displayed Parts:Off
+structureOption: Monolithic
+Export Units:Inch
+Export Tolerance Value:0.050000
+Export Tolerance Type:Custom
+Export Surface Plane Angle Value:0.523599
+
+Translation progress:
+Translation process completed
+Time required to translate:00 : 00 : 00
