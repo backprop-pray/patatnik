@@ -20,11 +20,19 @@ def load_threshold_bundle(path: Path) -> ThresholdBundle:
 def load_model_bundle(config: Batch2Config) -> Batch2ModelBundle:
     bundle_dir = resolve_bundle_dir(config)
     metadata_path = Path(config.patchcore.metadata_path) if config.patchcore.metadata_path else bundle_dir / "bundle.json"
-    checkpoint_path = Path(config.patchcore.checkpoint_path) if config.patchcore.checkpoint_path else bundle_dir / "model.ckpt"
     if not metadata_path.exists():
         raise FileNotFoundError(f"Bundle metadata not found: {metadata_path}")
     payload = json.loads(metadata_path.read_text())
+    checkpoint_path = (
+        Path(config.patchcore.checkpoint_path)
+        if config.patchcore.checkpoint_path
+        else Path(payload.get("checkpoint_path", bundle_dir / "model.ckpt"))
+    )
     thresholds_path = Path(payload.get("thresholds_path", bundle_dir / "thresholds.json"))
+    if not thresholds_path.is_absolute() and not thresholds_path.exists():
+        thresholds_path = metadata_path.parent / thresholds_path
+    if not checkpoint_path.is_absolute() and not checkpoint_path.exists():
+        checkpoint_path = metadata_path.parent / checkpoint_path
     thresholds = load_threshold_bundle(thresholds_path)
     bundle = Batch2ModelBundle(
         bundle_dir=str(bundle_dir),

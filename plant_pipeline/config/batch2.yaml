@@ -6,7 +6,7 @@ batch2:
 patchcore:
   backend: patchcore
   dataset_root: ./data/datasets/roi_anomaly
-  bundle_root: ./data/models/batch2_patchcore
+  bundle_root: ./goshko/plant_pipeline/params
   checkpoint_path: ""
   metadata_path: ""
   normal_train_dir: ./data/datasets/roi_anomaly/train/good
@@ -28,7 +28,7 @@ patchcore:
   normalization_method: min_max
   device: cpu
   model_name: patchcore
-  model_version: patchcore-wideresnet50-v1
+  model_version: patchcore-wideresnet50-v1-runpod
   allow_inference_fallback: false
 thresholds:
   lower_threshold:
