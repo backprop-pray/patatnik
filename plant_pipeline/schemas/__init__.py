@@ -33,3 +33,24 @@ __all__ = [
     "UploadArtifactSet",
     "UploadStatus",
 ]
+from plant_pipeline.schemas.batch2 import (
+    Batch2ErrorResult,
+    Batch2FolderRequest,
+    Batch2FolderResult,
+    Batch2ModelBundle,
+    Batch2Request,
+    SuspicionLabel,
+    SuspicionResult,
+    ThresholdBundle,
+)
+
+__all__ = [
+    "Batch2ErrorResult",
+    "Batch2FolderRequest",
+    "Batch2FolderResult",
+    "Batch2ModelBundle",
+    "Batch2Request",
+    "SuspicionLabel",
+    "SuspicionResult",
+    "ThresholdBundle",
+]

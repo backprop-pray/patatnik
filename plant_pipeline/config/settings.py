@@ -89,6 +89,51 @@ class Batch1ApiSettings(BaseModel):
     enable_api: bool = False
 
 
+class Batch2Settings(BaseModel):
+    output_root: str = "./data/batch2"
+    write_anomaly_map: bool = True
+    anomaly_map_format: str = "png"
+    roi_glob_pattern: str = "*.png"
+
+
+class Batch2PatchCoreSettings(BaseModel):
+    backend: str = "patchcore"
+    dataset_root: str = "./data/datasets/roi_anomaly"
+    bundle_root: str = "./data/models/batch2_patchcore"
+    checkpoint_path: str = ""
+    metadata_path: str = ""
+    normal_train_dir: str = "./data/datasets/roi_anomaly/train/good"
+    val_good_dir: str = "./data/datasets/roi_anomaly/val/good"
+    val_bad_dir: str = "./data/datasets/roi_anomaly/val/bad"
+    test_good_dir: str = "./data/datasets/roi_anomaly/test/good"
+    test_bad_dir: str = "./data/datasets/roi_anomaly/test/bad"
+    image_size: int = 224
+    center_crop: Optional[int] = None
+    backbone: str = "wide_resnet50_2"
+    layers: list[str] = Field(default_factory=lambda: ["layer2", "layer3"])
+    coreset_sampling_ratio: float = 0.1
+    num_neighbors: int = 9
+    normalization_method: str = "min_max"
+    device: str = "cpu"
+    model_name: str = "patchcore"
+    model_version: str = "patchcore-wideresnet50-v1"
+
+
+class Batch2ThresholdSettings(BaseModel):
+    lower_threshold: Optional[float] = None
+    upper_threshold: Optional[float] = None
+    normal_percentile: float = 0.95
+    suspicious_percentile: float = 0.995
+    min_gap: float = 0.05
+    confidence_midpoint_weight: float = 1.0
+
+
+class Batch2ApiSettings(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 8001
+    enable_api: bool = False
+
+
 class DetectSettings(BaseModel):
     min_prefilter_fraction: float = 0.04
     confidence_threshold: float = 0.55
@@ -167,6 +212,13 @@ class Batch1Config(BaseModel):
     api: Batch1ApiSettings = Field(default_factory=Batch1ApiSettings)
 
 
+class Batch2Config(BaseModel):
+    batch2: Batch2Settings = Field(default_factory=Batch2Settings)
+    patchcore: Batch2PatchCoreSettings = Field(default_factory=Batch2PatchCoreSettings)
+    thresholds: Batch2ThresholdSettings = Field(default_factory=Batch2ThresholdSettings)
+    api: Batch2ApiSettings = Field(default_factory=Batch2ApiSettings)
+
+
 def load_settings(path: Optional[Union[str, Path]] = None) -> PipelineSettings:
     if path is None:
         path = Path(__file__).with_name("default.yaml")
@@ -183,3 +235,12 @@ def load_batch1_settings(path: Optional[Union[str, Path]] = None) -> Batch1Confi
         path = Path(path)
     payload: dict[str, Any] = yaml.safe_load(path.read_text()) or {}
     return Batch1Config.model_validate(payload)
+
+
+def load_batch2_settings(path: Optional[Union[str, Path]] = None) -> Batch2Config:
+    if path is None:
+        path = Path(__file__).with_name("batch2.yaml")
+    else:
+        path = Path(path)
+    payload: dict[str, Any] = yaml.safe_load(path.read_text()) or {}
+    return Batch2Config.model_validate(payload)

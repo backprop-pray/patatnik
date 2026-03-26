@@ -1,0 +1,39 @@
+batch2:
+  output_root: ./data/batch2
+  write_anomaly_map: true
+  anomaly_map_format: png
+  roi_glob_pattern: "*.png"
+patchcore:
+  backend: patchcore
+  dataset_root: ./data/datasets/roi_anomaly
+  bundle_root: ./data/models/batch2_patchcore
+  checkpoint_path: ""
+  metadata_path: ""
+  normal_train_dir: ./data/datasets/roi_anomaly/train/good
+  val_good_dir: ./data/datasets/roi_anomaly/val/good
+  val_bad_dir: ./data/datasets/roi_anomaly/val/bad
+  test_good_dir: ./data/datasets/roi_anomaly/test/good
+  test_bad_dir: ./data/datasets/roi_anomaly/test/bad
+  image_size: 224
+  center_crop:
+  backbone: wide_resnet50_2
+  layers:
+    - layer2
+    - layer3
+  coreset_sampling_ratio: 0.1
+  num_neighbors: 9
+  normalization_method: min_max
+  device: cpu
+  model_name: patchcore
+  model_version: patchcore-wideresnet50-v1
+thresholds:
+  lower_threshold:
+  upper_threshold:
+  normal_percentile: 0.95
+  suspicious_percentile: 0.995
+  min_gap: 0.05
+  confidence_midpoint_weight: 1.0
+api:
+  host: 127.0.0.1
+  port: 8001
+  enable_api: false
