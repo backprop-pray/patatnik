@@ -38,4 +38,12 @@ public class PlantController extends BaseController {
                 .status(HttpStatus.CREATED)
                 .body(ApiResponse.success(201, "Plant created successfully", data));
     }
+
+    @GetMapping
+    public ResponseEntity<ApiResponse<java.util.List<PlantResponse>>> getPlants(
+            @RequestHeader("Authorization") String authHeader) {
+        User user = resolveUser(authHeader);
+        java.util.List<PlantResponse> data = plantService.getPlantsByUser(user);
+        return ResponseEntity.ok(ApiResponse.success(200, "Plants fetched successfully", data));
+    }
 }

@@ -43,4 +43,12 @@ public class PlantServiceImpl implements PlantService {
 
         return PlantResponse.fromEntity(plant);
     }
+
+    @Override
+    public java.util.List<PlantResponse> getPlantsByUser(User user) {
+        return plantRepository.findByUserIdOrderByCreatedAtDesc(user.getId())
+                .stream()
+                .map(PlantResponse::fromEntity)
+                .collect(java.util.stream.Collectors.toList());
+    }
 }
