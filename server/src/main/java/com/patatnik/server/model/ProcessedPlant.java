@@ -30,10 +30,10 @@ public class ProcessedPlant {
     private String recommendedAction;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "recommended_action_user_source", nullable = false)
+    @JoinColumn(name = "recommended_action_user_id", nullable = false)
     private User recommendedActionUserSource;
 
-    @Column(nullable = false, updatable = false)
+    @Column(name = "created_at", nullable = false, updatable = false)
     @Builder.Default
     private LocalDateTime createdAt = LocalDateTime.now();
 }
