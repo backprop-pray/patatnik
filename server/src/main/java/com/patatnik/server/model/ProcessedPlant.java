@@ -21,8 +21,8 @@ public class ProcessedPlant {
     @JoinColumn(name = "plant_id", nullable = false)
     private Plant plant;
 
-    @Column(nullable = false)
-    private String healthStatus;
+    // @Column(nullable = false)
+    // private String healthStatus;
 
     private String disease;
 
@@ -31,7 +31,7 @@ public class ProcessedPlant {
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "recommended_action_user_id", nullable = false)
-    private User recommendedActionUserSource;
+    private User recommendedActionUserId;
 
     @Column(name = "created_at", nullable = false, updatable = false)
     @Builder.Default
