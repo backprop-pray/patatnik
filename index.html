@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Patatnik</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: linear-gradient(135deg, #f5efe4 0%, #d6e7db 100%);
+        --panel: rgba(255, 252, 246, 0.88);
+        --text: #173127;
+        --muted: #496358;
+        --accent: #2e8b57;
+        --accent-dark: #1f6640;
+        --shadow: 0 18px 50px rgba(23, 49, 39, 0.15);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        font-family: Georgia, "Times New Roman", serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+
+      main {
+        width: min(100%, 680px);
+        padding: 48px 36px;
+        border-radius: 28px;
+        background: var(--panel);
+        box-shadow: var(--shadow);
+        text-align: center;
+        backdrop-filter: blur(10px);
+      }
+
+      h1 {
+        margin: 0 0 16px;
+        font-size: clamp(2.4rem, 6vw, 4.5rem);
+        line-height: 0.95;
+        letter-spacing: -0.04em;
+      }
+
+      p {
+        margin: 0;
+        font-size: 1.1rem;
+        line-height: 1.7;
+        color: var(--muted);
+      }
+
+      .hint {
+        margin-top: 28px;
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 14px 20px;
+        border: 0;
+        border-radius: 999px;
+        background: var(--accent);
+        color: #fff;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+        transition: transform 160ms ease, background 160ms ease;
+      }
+
+      .hint:hover,
+      .hint:focus-visible {
+        transform: translateY(-2px);
+        background: var(--accent-dark);
+        outline: none;
+      }
+
+      kbd {
+        padding: 3px 8px;
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.32);
+        border: 1px solid rgba(255, 255, 255, 0.45);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Patatnik</h1>
+      <p>Press Enter to jump straight to the GitHub repository.</p>
+      <button class="hint" type="button" id="open-link">
+        Open repository <kbd>Enter</kbd>
+      </button>
+    </main>
+
+    <script>
+      const targetUrl = "https://github.com/backprop-pray/patatnik";
+      const redirect = () => {
+        window.location.href = targetUrl;
+      };
+
+      document.getElementById("open-link").addEventListener("click", redirect);
+
+      window.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          redirect();
+        }
+      });
+    </script>
+  </body>
+</html>

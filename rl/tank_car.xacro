@@ -1,0 +1,546 @@
+<?xml version="1.0"?>
+<robot name="tank_car" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <!--
+    Updated XACRO model of a very small tracked tank-like car.
+
+    Changes from the first version:
+    - Chassis is 8 cm x 15 cm (width x length).
+    - Tracks are 4 cm wide and 17 cm long.
+    - Overall height is 5 cm.
+    - Lower ride height / less tall stance.
+    - Decorative motors moved UNDER the platform instead of sticking outside.
+
+    Notes:
+    - The center platform/chassis stays narrower than the full vehicle, like in the reference image.
+    - Tracks are simplified as rigid visual boxes (no collision contact).
+  -->
+
+  <xacro:property name="pi" value="3.1415926535897931"/>
+
+  <!-- Main dimensions (meters) -->
+  <xacro:property name="body_length" value="0.15"/>
+  <xacro:property name="body_width"  value="0.08"/>
+  <xacro:property name="body_height" value="0.008"/>
+  <xacro:property name="body_ground_clearance" value="0.030"/>
+
+  <!-- Track + wheel geometry -->
+  <xacro:property name="track_width"       value="0.040"/>
+  <xacro:property name="wheel_radius"      value="0.025"/>
+  <xacro:property name="wheel_thickness"   value="0.020"/>
+  <xacro:property name="wheelbase"         value="0.120"/>
+  <xacro:property name="track_loop_length" value="${wheelbase + 2.0*wheel_radius}"/>
+  <xacro:property name="track_loop_height" value="${2.0*wheel_radius}"/>
+  <xacro:property name="track_center_y"    value="${body_width/2.0 + track_width/2.0}"/>
+
+  <!-- Derived positions -->
+  <xacro:property name="body_center_z" value="${body_ground_clearance + body_height/2.0}"/>
+  <xacro:property name="wheel_center_rel_z" value="${wheel_radius - body_center_z}"/>
+  <xacro:property name="front_x" value="${ wheelbase/2.0}"/>
+  <xacro:property name="rear_x"  value="${-wheelbase/2.0}"/>
+
+  <!-- Decorative motors now tucked under the platform -->
+  <xacro:property name="motor_radius" value="0.010"/>
+  <xacro:property name="motor_length" value="0.018"/>
+  <xacro:property name="motor_inset_y" value="${body_width/2.0 - motor_length/2.0 - 0.002}"/>
+  <xacro:property name="motor_underbody_z" value="${-body_height/2.0 - motor_radius}"/>
+
+  <!-- Blue box moved to front underside, rotated 90 deg -->
+  <xacro:property name="under_box_length" value="0.036"/>
+  <xacro:property name="under_box_width" value="0.024"/>
+  <xacro:property name="under_box_height" value="0.018"/>
+  <xacro:property name="under_box_mass" value="0.015"/>
+  <xacro:property name="under_box_x" value="${body_length/2.0 - under_box_length/2.0 + 0.006}"/>
+  <xacro:property name="under_box_z" value="${-body_height/2.0 - under_box_height/2.0}"/>
+  <xacro:property name="top_box_x" value="${body_length/2.0 - under_box_length/2.0 - 0.008}"/>
+  <xacro:property name="top_box_z" value="${body_height/2.0 + under_box_height/2.0 + 0.012}"/>
+  <xacro:property name="top_box_y_offset" value="0.030"/>
+  <xacro:property name="sensor_eye_radius" value="0.0035"/>
+  <xacro:property name="sensor_eye_length" value="0.005"/>
+  <xacro:property name="sensor_eye_x_offset" value="0.006"/>
+
+  <!-- Rear floating cone (approximated with tapered cylinders) -->
+  <xacro:property name="rear_cone_height" value="0.040"/>
+  <xacro:property name="rear_cone_radius" value="0.014"/>
+  <xacro:property name="rear_cone_mass" value="0.015"/>
+  <xacro:property name="rear_cone_x" value="${-body_length/2.0 - 0.015}"/>
+  <xacro:property name="rear_cone_z" value="-0.010"/>
+
+  <!-- Rear cylinder from butt: 8 cm, tilted -30 deg -->
+  <xacro:property name="rear_butt_cyl_length" value="0.080"/>
+  <xacro:property name="rear_butt_cyl_radius" value="0.006"/>
+  <xacro:property name="rear_butt_cyl_mass" value="0.012"/>
+  <xacro:property name="rear_butt_cyl_axis_y" value="${2*pi/3}"/>
+  <xacro:property name="rear_butt_cyl_center_x" value="${-body_length/2.0 - 0.5*rear_butt_cyl_length*0.8660254}"/>
+  <xacro:property name="rear_butt_cyl_center_z" value="${0.5*rear_butt_cyl_length*0.5}"/>
+
+  <!-- Front high webcam-like circular body -->
+  <xacro:property name="webcam_radius" value="0.028"/>
+  <xacro:property name="webcam_thickness" value="0.016"/>
+  <xacro:property name="webcam_mass" value="0.020"/>
+  <xacro:property name="webcam_x" value="${body_length/2.0 - 0.002}"/>
+  <xacro:property name="webcam_z" value="0.105"/>
+  <xacro:property name="webcam_lens_radius" value="0.010"/>
+  <xacro:property name="webcam_lens_depth" value="0.004"/>
+  <xacro:property name="webcam_pole_radius" value="0.0025"/>
+  <xacro:property name="webcam_pole_mass" value="0.006"/>
+  <xacro:property name="webcam_pole_height" value="${webcam_z - body_height/2.0}"/>
+
+  <!-- Small front-top lens -->
+  <xacro:property name="front_top_box_size" value="0.020"/>
+  <xacro:property name="front_top_box_height" value="0.006"/>
+  <xacro:property name="front_top_box_mass" value="0.002"/>
+  <xacro:property name="front_top_lens_radius" value="0.005"/>
+  <xacro:property name="front_top_box_x" value="${body_length/2.0 - front_top_box_height/2.0}"/>
+  <xacro:property name="front_top_box_z" value="${body_height/2.0 + front_top_box_size/2.0}"/>
+
+  <!-- Mid-platform raspberry-like module -->
+  <xacro:property name="raspberry_length" value="0.060"/>
+  <xacro:property name="raspberry_width" value="0.045"/>
+  <xacro:property name="raspberry_height" value="0.012"/>
+  <xacro:property name="raspberry_mass" value="0.020"/>
+  <xacro:property name="raspberry_z" value="${body_height/2.0 + raspberry_height/2.0}"/>
+
+  <!-- Masses -->
+  <xacro:property name="body_mass"        value="0.40"/>
+  <xacro:property name="wheel_mass"       value="0.03"/>
+  <xacro:property name="track_mass"       value="0.05"/>
+  <xacro:property name="motor_mass"       value="0.04"/>
+
+  <!-- Materials -->
+  <material name="silver">
+    <color rgba="0.80 0.80 0.82 1.0"/>
+  </material>
+  <material name="dark_gray">
+    <color rgba="0.20 0.20 0.22 1.0"/>
+  </material>
+  <material name="gray">
+    <color rgba="0.55 0.55 0.58 1.0"/>
+  </material>
+  <material name="black">
+    <color rgba="0.05 0.05 0.05 1.0"/>
+  </material>
+  <material name="blue">
+    <color rgba="0.10 0.35 0.95 1.0"/>
+  </material>
+  <material name="green">
+    <color rgba="0.10 0.75 0.20 1.0"/>
+  </material>
+  <material name="dark_green">
+    <color rgba="0.06 0.28 0.10 1.0"/>
+  </material>
+
+  <xacro:macro name="box_inertial" params="mass x y z">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="${mass}"/>
+      <inertia
+        ixx="${mass*(y*y + z*z)/12.0}"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="${mass*(x*x + z*z)/12.0}"
+        iyz="0.0"
+        izz="${mass*(x*x + y*y)/12.0}"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="cylinder_inertial" params="mass radius length">
+    <inertial>
+      <!-- Cylinder axis is rotated onto the Y-axis to match the wheel axle direction -->
+      <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+      <mass value="${mass}"/>
+      <inertia
+        ixx="${mass*(3.0*radius*radius + length*length)/12.0}"
+        ixy="0.0"
+        ixz="0.0"
+        iyy="${mass*(3.0*radius*radius + length*length)/12.0}"
+        iyz="0.0"
+        izz="${0.5*mass*radius*radius}"/>
+    </inertial>
+  </xacro:macro>
+
+  <xacro:macro name="wheel_link" params="name">
+    <link name="${name}">
+      <xacro:cylinder_inertial mass="${wheel_mass}" radius="${wheel_radius}" length="${wheel_thickness}"/>
+      <visual>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_thickness}"/>
+        </geometry>
+        <material name="silver"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_thickness}"/>
+        </geometry>
+      </collision>
+    </link>
+  </xacro:macro>
+
+  <xacro:macro name="track_link" params="name">
+    <link name="${name}">
+      <xacro:box_inertial mass="${track_mass}" x="${track_loop_length}" y="${track_width}" z="${track_loop_height}"/>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <box size="${track_loop_length} ${track_width} ${track_loop_height}"/>
+        </geometry>
+        <material name="black"/>
+      </visual>
+    </link>
+  </xacro:macro>
+
+  <xacro:macro name="motor_link" params="name">
+    <link name="${name}">
+      <xacro:cylinder_inertial mass="${motor_mass}" radius="${motor_radius}" length="${motor_length}"/>
+      <visual>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${motor_radius}" length="${motor_length}"/>
+        </geometry>
+        <material name="dark_gray"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${motor_radius}" length="${motor_length}"/>
+        </geometry>
+      </collision>
+    </link>
+  </xacro:macro>
+
+  <xacro:macro name="ultrasonic_sensor_link" params="name eye_side_sign">
+    <link name="${name}">
+      <xacro:box_inertial mass="${under_box_mass}" x="${under_box_length}" y="${under_box_width}" z="${under_box_height}"/>
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <box size="${under_box_length} ${under_box_width} ${under_box_height}"/>
+        </geometry>
+        <material name="blue"/>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <box size="${under_box_length} ${under_box_width} ${under_box_height}"/>
+        </geometry>
+      </collision>
+      <visual>
+        <origin xyz="${sensor_eye_x_offset} ${eye_side_sign*(under_box_width/2.0 + sensor_eye_length/2.0)} 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${sensor_eye_radius}" length="${sensor_eye_length}"/>
+        </geometry>
+        <material name="black"/>
+      </visual>
+      <visual>
+        <origin xyz="${-sensor_eye_x_offset} ${eye_side_sign*(under_box_width/2.0 + sensor_eye_length/2.0)} 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${sensor_eye_radius}" length="${sensor_eye_length}"/>
+        </geometry>
+        <material name="black"/>
+      </visual>
+      <collision>
+        <origin xyz="${sensor_eye_x_offset} ${eye_side_sign*(under_box_width/2.0 + sensor_eye_length/2.0)} 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${sensor_eye_radius}" length="${sensor_eye_length}"/>
+        </geometry>
+      </collision>
+      <collision>
+        <origin xyz="${-sensor_eye_x_offset} ${eye_side_sign*(under_box_width/2.0 + sensor_eye_length/2.0)} 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${sensor_eye_radius}" length="${sensor_eye_length}"/>
+        </geometry>
+      </collision>
+    </link>
+  </xacro:macro>
+
+  <link name="base_footprint"/>
+
+  <link name="chassis">
+    <xacro:box_inertial mass="${body_mass}" x="${body_length}" y="${body_width}" z="${body_height}"/>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${body_length} ${body_width} ${body_height}"/>
+      </geometry>
+      <material name="silver"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${body_length} ${body_width} ${body_height}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="base_footprint_to_chassis" type="fixed">
+    <parent link="base_footprint"/>
+    <child link="chassis"/>
+    <origin xyz="0 0 ${body_center_z}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Wheels / sprockets -->
+  <xacro:wheel_link name="front_left_drive_wheel"/>
+  <xacro:wheel_link name="rear_left_idler_wheel"/>
+  <xacro:wheel_link name="front_right_idler_wheel"/>
+  <xacro:wheel_link name="rear_right_drive_wheel"/>
+
+  <joint name="front_left_drive_joint" type="continuous">
+    <parent link="chassis"/>
+    <child link="front_left_drive_wheel"/>
+    <origin xyz="${front_x} ${ track_center_y} ${wheel_center_rel_z}" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <joint name="rear_left_idler_joint" type="continuous">
+    <parent link="chassis"/>
+    <child link="rear_left_idler_wheel"/>
+    <origin xyz="${rear_x} ${ track_center_y} ${wheel_center_rel_z}" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+  <joint name="front_right_idler_joint" type="continuous">
+    <parent link="chassis"/>
+    <child link="front_right_idler_wheel"/>
+    <origin xyz="${front_x} ${-track_center_y} ${wheel_center_rel_z}" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <dynamics damping="0.0" friction="0.0"/>
+  </joint>
+
+  <joint name="rear_right_drive_joint" type="continuous">
+    <parent link="chassis"/>
+    <child link="rear_right_drive_wheel"/>
+    <origin xyz="${rear_x} ${-track_center_y} ${wheel_center_rel_z}" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+  </joint>
+
+  <!-- Simplified rigid track bodies -->
+  <xacro:track_link name="left_track"/>
+  <xacro:track_link name="right_track"/>
+
+  <joint name="left_track_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="left_track"/>
+    <origin xyz="0 ${ track_center_y} ${wheel_center_rel_z}" rpy="0 0 0"/>
+  </joint>
+
+  <joint name="right_track_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="right_track"/>
+    <origin xyz="0 ${-track_center_y} ${wheel_center_rel_z}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Decorative motors tucked under the platform on the driven corners -->
+  <xacro:motor_link name="front_left_motor"/>
+  <xacro:motor_link name="rear_right_motor"/>
+
+  <joint name="front_left_motor_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="front_left_motor"/>
+    <origin xyz="${front_x} ${motor_inset_y} ${motor_underbody_z}" rpy="0 0 0"/>
+  </joint>
+
+  <joint name="rear_right_motor_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="rear_right_motor"/>
+    <origin xyz="${rear_x} ${-motor_inset_y} ${motor_underbody_z}" rpy="0 0 0"/>
+  </joint>
+
+  <xacro:ultrasonic_sensor_link name="under_platform_box" eye_side_sign="-1"/>
+
+  <joint name="under_platform_box_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="under_platform_box"/>
+    <origin xyz="${under_box_x} 0 ${under_box_z}" rpy="0 0 ${pi/2}"/>
+  </joint>
+
+  <xacro:ultrasonic_sensor_link name="top_platform_box_left" eye_side_sign="-1"/>
+
+  <joint name="top_platform_box_left_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="top_platform_box_left"/>
+    <origin xyz="${top_box_x} ${top_box_y_offset} ${top_box_z}" rpy="0 0 ${pi}"/>
+  </joint>
+
+  <xacro:ultrasonic_sensor_link name="top_platform_box_right" eye_side_sign="1"/>
+
+  <joint name="top_platform_box_right_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="top_platform_box_right"/>
+    <origin xyz="${top_box_x} ${-top_box_y_offset} ${top_box_z}" rpy="0 0 ${pi}"/>
+  </joint>
+
+  <link name="rear_floating_cone">
+    <xacro:cylinder_inertial mass="${rear_cone_mass}" radius="${rear_cone_radius}" length="${rear_cone_height}"/>
+    <visual>
+      <origin xyz="0 0 ${rear_cone_height/3.0}" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${rear_cone_radius}" length="${rear_cone_height/3.0}"/>
+      </geometry>
+      <material name="dark_gray"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${0.66*rear_cone_radius}" length="${rear_cone_height/3.0}"/>
+      </geometry>
+      <material name="dark_gray"/>
+    </visual>
+    <visual>
+      <origin xyz="0 0 ${-rear_cone_height/3.0}" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${0.33*rear_cone_radius}" length="${rear_cone_height/3.0}"/>
+      </geometry>
+      <material name="dark_gray"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${rear_cone_radius}" length="${rear_cone_height}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="rear_floating_cone_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="rear_floating_cone"/>
+    <origin xyz="${rear_cone_x} 0 ${rear_cone_z}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="rear_butt_cylinder">
+    <xacro:cylinder_inertial mass="${rear_butt_cyl_mass}" radius="${rear_butt_cyl_radius}" length="${rear_butt_cyl_length}"/>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 ${rear_butt_cyl_axis_y} 0"/>
+      <geometry>
+        <cylinder radius="${rear_butt_cyl_radius}" length="${rear_butt_cyl_length}"/>
+      </geometry>
+      <material name="dark_gray"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 ${rear_butt_cyl_axis_y} 0"/>
+      <geometry>
+        <cylinder radius="${rear_butt_cyl_radius}" length="${rear_butt_cyl_length}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="rear_butt_cylinder_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="rear_butt_cylinder"/>
+    <origin xyz="${rear_butt_cyl_center_x} 0 ${rear_butt_cyl_center_z}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="front_webcam_pole">
+    <xacro:cylinder_inertial mass="${webcam_pole_mass}" radius="${webcam_pole_radius}" length="${webcam_pole_height}"/>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${webcam_pole_radius}" length="${webcam_pole_height}"/>
+      </geometry>
+      <material name="dark_gray"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="${webcam_pole_radius}" length="${webcam_pole_height}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="front_webcam_pole_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="front_webcam_pole"/>
+    <origin xyz="${webcam_x} 0 ${body_height/2.0 + webcam_pole_height/2.0}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="front_webcam">
+    <xacro:box_inertial mass="${webcam_mass}" x="${webcam_thickness}" y="${2.0*webcam_radius}" z="${2.0*webcam_radius}"/>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 ${pi/2} 0"/>
+      <geometry>
+        <cylinder radius="${webcam_radius}" length="${webcam_thickness}"/>
+      </geometry>
+      <material name="gray"/>
+    </visual>
+    <visual>
+      <origin xyz="${webcam_thickness/2.0 + webcam_lens_depth/2.0} 0 0" rpy="0 ${pi/2} 0"/>
+      <geometry>
+        <cylinder radius="${webcam_lens_radius}" length="${webcam_lens_depth}"/>
+      </geometry>
+      <material name="black"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 ${pi/2} 0"/>
+      <geometry>
+        <cylinder radius="${webcam_radius}" length="${webcam_thickness}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="front_webcam_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="front_webcam"/>
+    <origin xyz="${webcam_x} 0 ${webcam_z}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="front_top_lens">
+    <xacro:box_inertial mass="${front_top_box_mass}" x="${front_top_box_height}" y="${front_top_box_size}" z="${front_top_box_size}"/>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${front_top_box_height} ${front_top_box_size} ${front_top_box_size}"/>
+      </geometry>
+      <material name="green"/>
+    </visual>
+    <visual>
+      <origin xyz="${front_top_box_height} 0 0" rpy="0 ${pi/2} 0"/>
+      <geometry>
+        <cylinder radius="${front_top_lens_radius}" length="${front_top_box_height}"/>
+      </geometry>
+      <material name="black"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${front_top_box_height} ${front_top_box_size} ${front_top_box_size}"/>
+      </geometry>
+    </collision>
+    <collision>
+      <origin xyz="${front_top_box_height} 0 0" rpy="0 ${pi/2} 0"/>
+      <geometry>
+        <cylinder radius="${front_top_lens_radius}" length="${front_top_box_height}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="front_top_lens_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="front_top_lens"/>
+    <origin xyz="${front_top_box_x} 0 ${front_top_box_z}" rpy="0 0 0"/>
+  </joint>
+
+  <link name="middle_raspberry_module">
+    <xacro:box_inertial mass="${raspberry_mass}" x="${raspberry_length}" y="${raspberry_width}" z="${raspberry_height}"/>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${raspberry_length} ${raspberry_width} ${raspberry_height}"/>
+      </geometry>
+      <material name="dark_green"/>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="${raspberry_length} ${raspberry_width} ${raspberry_height}"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <joint name="middle_raspberry_module_joint" type="fixed">
+    <parent link="chassis"/>
+    <child link="middle_raspberry_module"/>
+    <origin xyz="0 0 ${raspberry_z}" rpy="0 0 0"/>
+  </joint>
+
+</robot>

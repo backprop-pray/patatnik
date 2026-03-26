@@ -1,0 +1,95 @@
+<mujoco model="agricultural_tank_base">
+    <option gravity="0 0 -9.81" timestep="0.005" integrator="implicitfast"/>
+    
+    <default>
+        <geom condim="3" friction="1 0.005 0.0001" solref="0.01 1" solimp=".9 .95 .001"/>
+        <joint damping="0.1"/>
+    </default>
+
+    <asset>
+        <texture name="grass_tex" type="2d" builtin="checker" rgb1="0.22 0.50 0.15" rgb2="0.28 0.55 0.20" width="512" height="512"/>
+        <material name="grass_mat" texture="grass_tex" texrepeat="12 12" texuniform="true" reflectance="0.05"/>
+        <texture name="sky_tex" type="skybox" builtin="gradient" rgb1="0.40 0.65 0.95" rgb2="0.85 0.92 1.0" width="512" height="512"/>
+        <material name="trunk_mat"  rgba="0.45 0.28 0.12 1" reflectance="0.05"/>
+        <material name="canopy_mat" rgba="0.18 0.55 0.18 1" reflectance="0.1"/>
+        <material name="crop_mat"   rgba="0.35 0.62 0.18 1" reflectance="0.05"/>
+        <material name="crop_ripe_mat" rgba="0.80 0.72 0.15 1" reflectance="0.05"/>
+        <material name="weed_mat" rgba="0.25 0.65 0.18 1" reflectance="0.08"/>
+        <material name="fence_mat" rgba="0.60 0.42 0.22 1" reflectance="0.05"/>
+        <material name="rock_mat" rgba="0.5 0.5 0.5 1"/>
+        <hfield name="terrain" nrow="60" ncol="60" size="20 20 0.3 0.1"/>
+    </asset>
+
+    <worldbody>
+        <light name="sun" directional="true" diffuse="1.0 0.95 0.8" specular="0.3 0.3 0.3" pos="5 -3 8" dir="-0.3 0.2 -1" castshadow="true"/>
+        <light name="fill" directional="true" diffuse="0.3 0.35 0.45" specular="0.05 0.05 0.05" pos="-4 4 6" dir="0.3 -0.3 -1" castshadow="false"/>
+
+        <!-- The Tank Car Body -->
+        <body name="rover" pos="0 0 0.05">
+            <joint type="free"/>
+            
+            <site name="marker" pos="0 0 0" size="0.02" rgba="0 0 1 1"/>
+            <camera name="rgb_cam" pos="0.15 0 0.2" xyaxes="0 -1 0 0 0 1" fovy="60"/>
+            
+            <site name="ray_front" pos="0.08 0 0.05" zaxis="1 0 0" type="cylinder" size="0.01 0.01" rgba="1 0 0 1"/>
+            <site name="ray_left" pos="0.08 0.05 0.05" zaxis="1 1 0" type="cylinder" size="0.01 0.01" rgba="1 0 0 1"/>
+            <site name="ray_right" pos="0.08 -0.05 0.05" zaxis="1 -1 0" type="cylinder" size="0.01 0.01" rgba="1 0 0 1"/>
+
+            <!-- Geometries -->
+            <geom size="0.075 0.04 0.004" pos="0 0 0.034" type="box" rgba="0.8 0.8 0.82 1" />
+            <geom size="0.01 0.009" pos="0.06 0.029 0.02" quat="0.707107 0.707107 0 0" type="cylinder" rgba="0.2 0.2 0.22 1" />
+            <geom size="0.01 0.009" pos="-0.06 -0.029 0.02" quat="0.707107 0.707107 0 0" type="cylinder" rgba="0.2 0.2 0.22 1" />
+            <geom size="0.018 0.012 0.009" pos="0.063 0 0.021" quat="0.707107 0 0 0.707107" type="box" rgba="0.1 0.35 0.95 1" />
+            <geom size="0.0035 0.0025" pos="0.0775 0.006 0.021" quat="0.5 0.5 0.5 0.5" type="cylinder" rgba="0.05 0.05 0.05 1" />
+            <geom size="0.0035 0.0025" pos="0.0775 -0.006 0.021" quat="0.5 0.5 0.5 0.5" type="cylinder" rgba="0.05 0.05 0.05 1" />
+            <geom size="0.018 0.012 0.009" pos="0.049 0.03 0.059" quat="0 0 0 1" type="box" rgba="0.1 0.35 0.95 1" />
+            <geom size="0.0035 0.0025" pos="0.043 0.0445 0.059" quat="0 0 0.707107 0.707107" type="cylinder" rgba="0.05 0.05 0.05 1" />
+            <geom size="0.0035 0.0025" pos="0.055 0.0445 0.059" quat="0 0 0.707107 0.707107" type="cylinder" rgba="0.05 0.05 0.05 1" />
+            <geom size="0.018 0.012 0.009" pos="0.049 -0.03 0.059" quat="0 0 0 1" type="box" rgba="0.1 0.35 0.95 1" />
+            <geom size="0.0035 0.0025" pos="0.043 -0.0445 0.059" quat="0 0 0.707107 0.707107" type="cylinder" rgba="0.05 0.05 0.05 1" />
+            <geom size="0.0035 0.0025" pos="0.055 -0.0445 0.059" quat="0 0 0.707107 0.707107" type="cylinder" rgba="0.05 0.05 0.05 1" />
+            <geom size="0.014 0.02" pos="-0.09 0 0.024" type="cylinder" rgba="0.2 0.2 0.22 1" />
+            <geom size="0.006 0.04" pos="-0.109641 0 0.054" quat="0.5 0 0.866025 0" type="cylinder" rgba="0.2 0.2 0.22 1" />
+            <geom size="0.0025 0.0505" pos="0.073 0 0.0885" type="cylinder" rgba="0.2 0.2 0.22 1" />
+            <geom size="0.028 0.008" pos="0.073 0 0.139" quat="0.707107 0 0.707107 0" type="cylinder" rgba="0.05 0.05 0.05 1" />
+            <geom size="0.003 0.01 0.01" pos="0.072 0 0.048" type="box" rgba="0.05 0.05 0.05 1" />
+            <geom size="0.005 0.003" pos="0.078 0 0.048" quat="0.707107 0 0.707107 0" type="cylinder" rgba="0.05 0.05 0.05 1" />
+            <geom size="0.03 0.0225 0.006" pos="0 0 0.044" type="box" rgba="0.06 0.28 0.1 1" />
+            
+            <body name="front_left_drive_wheel" pos="0.06 0.06 0.025">
+              <inertial pos="0 0 0" quat="0.5 0.5 -0.5 0.5" mass="0.03" diaginertia="0.001 0.001 0.001" />
+              <joint name="front_left_drive_joint" pos="0 0 0" axis="0 1 0" />
+              <geom size="0.025 0.01" quat="0.707107 0.707107 0 0" type="cylinder" rgba="0.8 0.8 0.82 1" />
+            </body>
+            <body name="rear_left_idler_wheel" pos="-0.06 0.06 0.025">
+              <inertial pos="0 0 0" quat="0.5 0.5 -0.5 0.5" mass="0.03" diaginertia="0.001 0.001 0.001" />
+              <joint name="rear_left_idler_joint" pos="0 0 0" axis="0 1 0" />
+              <geom size="0.025 0.01" quat="0.707107 0.707107 0 0" type="cylinder" rgba="0.8 0.8 0.82 1" />
+            </body>
+            <body name="front_right_idler_wheel" pos="0.06 -0.06 0.025">
+              <inertial pos="0 0 0" quat="0.5 0.5 -0.5 0.5" mass="0.03" diaginertia="0.001 0.001 0.001" />
+              <joint name="front_right_idler_joint" pos="0 0 0" axis="0 1 0" />
+              <geom size="0.025 0.01" quat="0.707107 0.707107 0 0" type="cylinder" rgba="0.8 0.8 0.82 1" />
+            </body>
+            <body name="rear_right_drive_wheel" pos="-0.06 -0.06 0.025">
+              <inertial pos="0 0 0" quat="0.5 0.5 -0.5 0.5" mass="0.03" diaginertia="0.001 0.001 0.001" />
+              <joint name="rear_right_drive_joint" pos="0 0 0" axis="0 1 0" />
+              <geom size="0.025 0.01" quat="0.707107 0.707107 0 0" type="cylinder" rgba="0.8 0.8 0.82 1" />
+            </body>
+        </body>
+    </worldbody>
+
+    <sensor>
+        <rangefinder name="rf_front" site="ray_front" cutoff="5.0"/>
+        <rangefinder name="rf_left" site="ray_left" cutoff="5.0"/>
+        <rangefinder name="rf_right" site="ray_right" cutoff="5.0"/>
+        <framepos name="rover_pos" objtype="site" objname="marker"/>
+    </sensor>
+
+    <actuator>
+        <motor name="fl_motor" joint="front_left_drive_joint" gear="0.01"/>
+        <motor name="rl_motor" joint="rear_left_idler_joint" gear="0.01"/>
+        <motor name="fr_motor" joint="front_right_idler_joint" gear="0.01"/>
+        <motor name="rr_motor" joint="rear_right_drive_joint" gear="0.01"/>
+    </actuator>
+</mujoco>
