@@ -1,2 +1,7 @@
 __pycache__
 .lgd-nfy0
+.env
+.venv
+__pycache__
+.vscode
+
