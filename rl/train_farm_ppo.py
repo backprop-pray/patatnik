@@ -3,38 +3,43 @@ import mujoco
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
-from agricultural_rover_env import AgriculturalRoverEnv
+from stable_baselines3.common.env_util import make_vec_env
+from wheat_farm_env import WheatFarmEnv
 
 def train():
-    print("Initializing environment...")
-    # Headless env for fast training
-    env = AgriculturalRoverEnv(base_xml_path="agricultural_tank_base.xml")
+    # Parallel environments for speed
+    n_envs = 8
+    print(f"Creating {n_envs} parallel environments...")
+    env = make_vec_env(
+        WheatFarmEnv, 
+        n_envs=n_envs, 
+        env_kwargs={"use_vision": False}
+    )
     
-    # Hyperparameters for PPO 
-    # Learning rate 3e-4 is standard. 
-    # Batch size 64 for small observation spaces.
+    # Hyperparameters for Hackathon speed
+    # Learning rate 1e-3 for faster initial climb. 
+    # Batch size 256 for stability with parallel envs.
     model = PPO(
         "MlpPolicy", 
         env, 
         verbose=1, 
-        learning_rate=3e-4,
+        learning_rate=1e-3,
         n_steps=2048,
-        batch_size=64,
+        batch_size=512,
         n_epochs=10,
         gamma=0.99,
-        # Use MPS for Mac Silicon, else CPU
-        device="mps" if torch.backends.mps.is_available() else "cpu",
-        tensorboard_log="./ppo_farm_logs/"
+        device="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"),
+        tensorboard_log="./ppo_farm_logs/PPO_wheat"
     )
 
-    print("Starting training (300,000 steps)...")
+    print("Starting training (2,000,000 steps)...")
     checkpoint_callback = CheckpointCallback(
-        save_freq=50000, 
+        save_freq=5000, 
         save_path="./models/",
-        name_prefix="ppo_rover"
+        name_prefix="ppo_rover_fast"
     )
 
-    model.learn(total_timesteps=300000, callback=checkpoint_callback)
+    model.learn(total_timesteps=2000000, callback=checkpoint_callback)
     
     model_path = "ppo_agricultural_rover_final"
     model.save(model_path)
@@ -45,7 +50,8 @@ def evaluate():
     from mujoco import viewer
     
     print("Evaluating trained model...")
-    env = AgriculturalRoverEnv(base_xml_path="agricultural_tank_base.xml")
+    # Must use same vision setting as training!
+    env = WheatFarmEnv(use_vision=False)
     model = PPO.load("ppo_agricultural_rover_final")
     
     obs, info = env.reset()

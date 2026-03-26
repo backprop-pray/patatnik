@@ -13,41 +13,51 @@ class AgriculturalRoverEnv(gym.Env):
         "render_fps": 20
     }
 
-    def __init__(self, render_mode=None, base_xml_path="agricultural_tank_base.xml", seed=None):
+    def __init__(self, render_mode=None, base_xml_path="agricultural_tank_base.xml", seed=None, use_vision=False):
         self.render_mode = render_mode
         self.base_xml_path = base_xml_path
+        self.use_vision = use_vision
         
         if not os.path.exists(self.base_xml_path):
             raise FileNotFoundError(f"Base XML file not found at {self.base_xml_path}")
             
         self.model = None
         self.data = None
+        self.np_random = np.random.RandomState(seed)
         
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
-        self.observation_space = spaces.Box(low=0.0, high=5.0, shape=(5,), dtype=np.float32) # Expanded for Vision (X, Y)
+        self.action_space = spaces.Discrete(9)
         
-        # Determine device (MPS for Mac Silicon, or CPU)
-        self.device = "mps" if torch.backends.mps.is_available() else "cpu"
+        # 3 sensors (front, left, right) + 2 vision if enabled
+        obs_shape = 5 if self.use_vision else 3
+        self.observation_space = spaces.Box(low=0.0, high=5.0, shape=(obs_shape,), dtype=np.float32) 
+        
+        # Determine device (CUDA, MPS, or CPU)
+        self.device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
         print(f"Vision running on device: {self.device}")
         
-        # Load FastSAM Heavyweight Vision AI once
-        self.vision_model = FastSAM("FastSAM-s.pt").to(self.device)
+        # Load FastSAM Heavyweight Vision AI ONLY if requested
+        if self.use_vision:
+            self.vision_model = FastSAM("FastSAM-s.pt").to(self.device)
+        else:
+            self.vision_model = None
         self.renderer = None
         
         self.reset(seed=seed)
 
     def spawn_crops(self, worldbody_node, row_base_spacing, num_plants, plant_spacing):
-        wave_freq = self.np_random.uniform(0.1, 0.4)
-        wave_amp = self.np_random.uniform(0.1, 0.3)
+        self.wave_freq = self.np_random.uniform(0.4, 0.8) # Sharper curves
+        self.wave_amp = self.np_random.uniform(1.5, 2.5)  # Extreme meandering curve
         
-        for row_idx, row_sign in enumerate([-1, 1]):
-            x_start = 0.5
-            for i in range(num_plants):
-                if self.np_random.random() < 0.1:
+        for i in range(num_plants):
+            base_x = 0.5 + i * plant_spacing
+            base_y = np.sin(base_x * self.wave_freq) * self.wave_amp
+            
+            for row_idx, row_sign in enumerate([-1, 1]):
+                if self.np_random.random() < 0.05: # Fewer missing plants to form solid walls
                     continue
                     
-                x_pos = x_start + i * plant_spacing + self.np_random.uniform(-0.05, 0.05)
-                y_pos = row_sign * (row_base_spacing / 2.0) + np.sin(x_pos * wave_freq) * wave_amp + self.np_random.uniform(-0.05, 0.05)
+                x_pos = base_x + self.np_random.uniform(-0.05, 0.05)
+                y_pos = base_y + row_sign * (row_base_spacing / 2.0) + self.np_random.uniform(-0.02, 0.02)
                 
                 mat = self.np_random.choice(["crop_mat", "crop_ripe_mat"], p=[0.7, 0.3])
                 
@@ -79,7 +89,7 @@ class AgriculturalRoverEnv(gym.Env):
             obs_body = ET.Element("body", name=f"obstacle_{i}", pos=f"{x_pos} {y_pos} 0")
             
             if obs_type == "rock":
-                for j in range(self.np_random.integers(1, 4)):
+                for j in range(self.np_random.randint(1, 4)):
                     r = self.np_random.uniform(0.05, 0.12)
                     ox = self.np_random.uniform(-0.1, 0.1)
                     oy = self.np_random.uniform(-0.1, 0.1)
@@ -128,15 +138,17 @@ class AgriculturalRoverEnv(gym.Env):
         ground = ET.Element("geom", name="ground", type="hfield", hfield="terrain", material="grass_mat", pos="0 0 0")
         worldbody.append(ground)
         
-        row_spacing = self.np_random.uniform(1.3, 1.8)
-        plant_spacing = self.np_random.uniform(0.3, 0.6)
-        num_plants_per_row = self.np_random.integers(20, 30)
-        num_obstacles = self.np_random.integers(3, 8)
+        # Perfectly + 25% fits: Robot width 0.14m * 1.25 = 0.175m gap.
+        # Letting it be slightly more forgiving for physics stability.
+        row_spacing = self.np_random.uniform(0.32, 0.42) 
+        plant_spacing = self.np_random.uniform(0.1, 0.2) # Extremely dense walls
+        num_plants_per_row = self.np_random.randint(60, 100) # Long endurance tracks
+        self.max_episode_steps = 1000 # Longer training rollouts
         
         max_x = num_plants_per_row * plant_spacing
         
         self.spawn_crops(worldbody, row_spacing, num_plants_per_row, plant_spacing)
-        self.spawn_obstacles(worldbody, num_obstacles, row_spacing, max_x)
+        # OBSTACLES REMOVED
         self.spawn_background(worldbody, max_x)
             
         return ET.tostring(root, encoding="unicode")
@@ -152,7 +164,11 @@ class AgriculturalRoverEnv(gym.Env):
         
         if self.renderer is not None:
             self.renderer.close()
-        self.renderer = mujoco.Renderer(self.model, 256, 256)
+        
+        if self.use_vision:
+            self.renderer = mujoco.Renderer(self.model, 256, 256)
+        else:
+            self.renderer = None
         
         if self.model.nhfield > 0:
             nrow = self.model.hfield_nrow[0]
@@ -170,6 +186,25 @@ class AgriculturalRoverEnv(gym.Env):
             self.model.hfield_data[:] = Z.flatten()
         
         self.data = mujoco.MjData(self.model)
+        self.step_count = 0 # Track steps for stagnation penalty
+        
+        # Phase 5: Precise Spawn on the curve
+        y_start = np.sin(0 * self.wave_freq) * self.wave_amp
+        # Slope dy/dx of sin(ax)*b is a*b*cos(ax)
+        slope = self.wave_freq * self.wave_amp * np.cos(0 * self.wave_freq)
+        yaw_start = np.arctan(slope)
+        
+        # Set QPOS: [x, y, z, qw, qx, qy, qz]
+        self.data.qpos[0] = 0.0
+        self.data.qpos[1] = y_start
+        self.data.qpos[2] = 0.05
+        
+        # Euler to Quaternion (Yaw only)
+        self.data.qpos[3] = np.cos(yaw_start / 2.0)
+        self.data.qpos[6] = np.sin(yaw_start / 2.0)
+        
+        # Kickstart the rover with a small initial velocity (0.5m/s)
+        self.data.qvel[0] = 0.5 
         mujoco.mj_forward(self.model, self.data)
         
         obs = self._get_obs()
@@ -185,6 +220,10 @@ class AgriculturalRoverEnv(gym.Env):
             if val < 0:
                 val = 5.0
             obs.append(val)
+            
+        # Skip expensive segmentation for Fast Hackathon Mode
+        if not self.use_vision:
+            return np.array(obs, dtype=np.float32)
             
         # FastSAM Vision integration
         self.renderer.update_scene(self.data, camera="rgb_cam")
@@ -212,14 +251,23 @@ class AgriculturalRoverEnv(gym.Env):
         return np.array(obs, dtype=np.float32)
         
     def step(self, action):
-        left_vel = action[0] * 5.0
-        right_vel = action[1] * 5.0
+        self.step_count += 1
+        action_idx = int(action)
+        motor_actions = [
+            (-1.0, -1.0), (-1.0, 0.0), (-1.0, 1.0),
+            (0.0, -1.0),  (0.0, 0.0),  (0.0, 1.0),
+            (1.0, -1.0),  (1.0, 0.0),  (1.0, 1.0)
+        ]
+        left_val, right_val = motor_actions[action_idx]
         
-        # If using our tank car's motors, the control input is essentially torque.
-        # We allow the env to map these properly.
-        # In this env, ctrl[0:4] corresponds to the 4 wheel motors.
+        # Balanced speed multiplier (5.0) for stable steering with alignment rewards.
+        speed_mult = 15.0
+        left_vel = left_val * speed_mult
+        right_vel = right_val * speed_mult
+        
+        # In the XML: 0=FL, 1=RL (Left) | 2=FR, 3=RR (Right)
         for i in range(min(len(self.data.ctrl), 4)):
-            self.data.ctrl[i] = action[i % 2] * 5.0
+            self.data.ctrl[i] = left_vel if i < 2 else right_vel
         
         robot_pos_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SENSOR, "rover_pos")
         pos_adr = self.model.sensor_adr[robot_pos_id]
@@ -231,23 +279,35 @@ class AgriculturalRoverEnv(gym.Env):
         obs = self._get_obs()
         curr_x = self.data.sensordata[pos_adr]
         
-        # 1. Forward Progress Reward
-        progress = curr_x - prev_x
-        reward = progress * 100.0  # Massive multiplier to force driving!
+        # 1. Continuous Alignment Progress Reward
+        # Reward = (Velocity Vector . Track Tangent)
+        track_angle = np.arctan(self.wave_freq * self.wave_amp * np.cos(curr_x * self.wave_freq))
+        tangent = np.array([np.cos(track_angle), np.sin(track_angle)])
         
-        # 2. Time Penalty
-        reward -= 0.05  # Bleed points for staying still to break 7-step plateau
+        # Get actual velocity from data
+        # qvel[0:3] is linear velocity [vx, vy, vz]
+        vel_vec = self.data.qvel[0:2]
+        alignment_reward = np.dot(vel_vec, tangent) * 10.0
+        reward = alignment_reward
+        
+        # 2. Anti-Spin / Anti-Stagnation Penalty
+        # qvel[3:6] is angular velocity. [rot_x, rot_y, yaw_rate]
+        yaw_rate = abs(self.data.qvel[5])
+        reward -= yaw_rate * 5.0 # Punish spinning in place
         
         # 3. Collision / Obstacle Penalty
-        # Penalty increases as we get very close to obstacles
-        if obs[0] < 0.25:
-            reward -= 2.0 * (1.0 - obs[0]/0.25)
+        if obs[0] < 0.2:
+            reward -= 50.0 * (1.0 - obs[0]/0.2)
             
-        # 4. Off-track / Lateral Penalty
-        # Encourage staying near the center (Y=0)
-        rover_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "rover")
-        curr_y = self.data.xpos[rover_body_id][1]
-        reward -= abs(curr_y) * 0.5
+        # 4. Off-track / Path-Following Penalty
+        if self.step_count > 80:
+            rover_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "rover")
+            curr_y = self.data.xpos[rover_body_id][1]
+            ideal_y = np.sin(curr_x * self.wave_freq) * self.wave_amp
+            deviation = abs(curr_y - ideal_y)
+            
+            # High penalty for not following the path center line
+            reward -= deviation * 500.0 
             
         terminated = False
         truncated = False
@@ -257,13 +317,13 @@ class AgriculturalRoverEnv(gym.Env):
             terminated = True
             reward += 100.0
             
-        # Fail condition (Collision or stuck)
-        if obs[0] < 0.1:
+        # 5. Collision Penalty
+        if obs[0] < 0.08:
             terminated = True
-            reward -= 50.0
+            reward -= 50000.0
             
-        if progress < 0.0001 and obs[0] > 1.0: # Times out if just sitting still
-             truncated = True
+        # 6. Section 6 Removed - Stagnation is now handled by continuous rewards
+        # (Alignment + Anti-Spin). Episodes run until collision or 1000 steps.
         
         info = {
             "x_progress": float(curr_x),
