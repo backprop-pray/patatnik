@@ -3,16 +3,26 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from plant_pipeline.anomaly.backends.efficientad_backend import EfficientAdBackend
 from plant_pipeline.anomaly.backends.patchcore_backend import PatchCoreBackend
 from plant_pipeline.anomaly.base import AnomalyBackend
 from plant_pipeline.config.settings import Batch2Config, load_batch2_settings
 from plant_pipeline.schemas.batch2 import Batch2FolderRequest, Batch2FolderResult, Batch2Request, SuspicionResult
 
 
+def build_anomaly_backend(config: Batch2Config) -> AnomalyBackend:
+    backend_name = config.batch2.backend.lower()
+    if backend_name == "efficientad":
+        return EfficientAdBackend(config)
+    if backend_name == "patchcore":
+        return PatchCoreBackend(config)
+    raise ValueError(f"Unsupported Batch 2 backend: {config.batch2.backend}")
+
+
 class Batch2Service:
     def __init__(self, config: Batch2Config, backend: Optional[AnomalyBackend] = None) -> None:
         self.config = config
-        self.backend = backend or PatchCoreBackend(config)
+        self.backend = backend or build_anomaly_backend(config)
         self.backend.load()
 
     def run_batch2(self, request: Batch2Request) -> SuspicionResult:
