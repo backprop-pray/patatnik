@@ -8,3 +8,5 @@ models/
 .venv
 .vscode
 __pycache__/
+.agents/
+plant_pipeline/test_images/
