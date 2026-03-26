@@ -1,0 +1,115 @@
+############################
+# Java / Spring Boot
+############################
+*.class
+*.log
+*.ctxt
+*.jar
+*.war
+*.ear
+
+# Ignore application config files (keep only generic ones in repo)
+application-*.yml
+application-*.yaml
+application-*.properties
+.env
+*.pid
+
+############################
+# Maven
+############################
+target/
+!.mvn/wrapper/maven-wrapper.jar
+!.mvn/wrapper/maven-wrapper.properties
+!**/src/main/**/target/
+!**/src/test/**/target/
+.mvn/timing.properties
+
+############################
+# Gradle
+############################
+.gradle/
+build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+gradle-app.setting
+!gradle-wrapper.jar
+
+############################
+# Spring Tool Suite / Eclipse
+############################
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings/
+.springBeans
+.sts4-cache
+
+############################
+# IntelliJ IDEA
+############################
+.idea/
+*.iws
+*.iml
+*.ipr
+out/
+
+############################
+# NetBeans
+############################
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+############################
+# VS Code
+############################
+.vscode/
+.history/
+*.code-workspace
+
+############################
+# OS-specific files
+############################
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+__MACOSX/
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+############################
+# Others
+############################
+# Logs
+*.log
+logs/
+*.out
+
+# Crash logs
+hs_err_pid*
+replay_pid*
+
+# Docker
+*.pid
+docker-compose.override.yml
+
+# JetBrains cache
+.idea_modules/
+
+# Backup / temp files
+*~
+*.swp
+*.swo
+*.bak
+*.tmp
+ 
