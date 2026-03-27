@@ -16,7 +16,6 @@ Safety  : hard deterministic override before every motor command
 Speed   : forward PWM scales with free_path_C in [MIN_FWD_DUTY, MAX_FWD_DUTY] = [30, 80] %
 """
 
-import collections
 import json
 import os
 import socket
@@ -386,14 +385,6 @@ class GreenNavigator:
 
 
 
-
-def _bin_sensor(v):
-    if v < 25:  return 0
-    if v < 60:  return 1
-    if v < 120: return 2
-    return 3
-
-
 # ── REWARD ────────────────────────────────────────────────────────────────────
 def compute_reward(raw_sensors, vf, action_idx, safety_triggered,
                    prev_center=0.0, prev_action=None):
@@ -558,8 +549,6 @@ def main():
     running      = True
     navigator    = GreenNavigator()
     prev_center  = 0.0   # for temporal progress reward
-    _recent_states = collections.deque(maxlen=60)
-    revisit_total  = 0
 
     # Watchdog: stops motors if main loop freezes for > 5 s
     import threading
@@ -593,7 +582,6 @@ def main():
 
             # 1. Ultrasonic sensors
             (raw_L, raw_F, raw_R), sensor_obs = read_sensors(rover)
-            _recent_states.append(action_idx)
 
             # 2. Camera + vision pipeline
             try:
@@ -656,21 +644,6 @@ def main():
                 prev_center, prev_act,
             )
             prev_center = vf.plant_C + vf.tree_C
-            # Oscillation penalty: detect periodic action cycles in the last 12 steps.
-            # A repeating 2-step cycle (e.g. spin_L <-> spin_R, or fwd <-> spin)
-            # signals plant ping-pong.  Steady forward driving has no periodicity.
-            _hist = list(_recent_states)
-            _oscillating = False
-            if len(_hist) >= 12:
-                _tail = _hist[-12:]
-                for _period in (2, 3, 4):
-                    _pattern = _tail[-_period:]
-                    if all(_tail[i] == _pattern[i % _period] for i in range(len(_tail))):
-                        _oscillating = True
-                        break
-            if _oscillating:
-                reward -= 0.5
-            revisit_total += int(_oscillating)
             ep_reward  += reward
 
             obs_buf.append(obs_n); act_buf.append(action_idx)
@@ -697,7 +670,7 @@ def main():
 
                 log.info(
                     f'step={step:6d}  rew={ep_reward:+7.2f}  '
-                    f'safe={safety_count:2d}  green={green_count:2d}  revisit={revisit_total:2d}  nav={navigator.state_name:8s}  '
+                    f'safe={safety_count:2d}  green={green_count:2d}  nav={navigator.state_name:8s}  '
                     f'us=({raw_L:5.1f},{raw_F:5.1f},{raw_R:5.1f})cm  '
                     f'plant=({vf.plant_L:.2f},{vf.plant_C:.2f},{vf.plant_R:.2f})  '
                     f'tree=({vf.tree_L:.2f},{vf.tree_C:.2f},{vf.tree_R:.2f})  '
@@ -707,7 +680,7 @@ def main():
                 model.save(CHECKPOINT)
                 obs_buf.clear(); act_buf.clear(); logp_buf.clear()
                 rew_buf.clear();  val_buf.clear()
-                ep_reward = 0.0;  safety_count = 0;  green_count = 0;  revisit_total = 0
+                ep_reward = 0.0;  safety_count = 0;  green_count = 0
 
             # 9. Pace loop
             _last_tick[0] = time.monotonic()

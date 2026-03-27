@@ -289,6 +289,67 @@ class Batch2Config(BaseModel):
     api: Batch2ApiSettings = Field(default_factory=Batch2ApiSettings)
 
 
+def _resolve_path(base_dir: Path, raw_value: Any) -> Any:
+    if not isinstance(raw_value, str) or raw_value == "":
+        return raw_value
+    candidate = Path(raw_value).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+    search_roots = [
+        base_dir,
+        base_dir.parent,
+        base_dir.parent.parent,
+        Path.cwd(),
+    ]
+    for root in search_roots:
+        resolved = (root / candidate).resolve()
+        if resolved.exists():
+            return str(resolved)
+    return str((base_dir / candidate).resolve())
+
+
+def _resolve_batch1_paths(payload: dict[str, Any], config_path: Path) -> dict[str, Any]:
+    base_dir = config_path.parent
+    detector = payload.get("detector_batch1")
+    if isinstance(detector, dict) and "model_path" in detector:
+        detector["model_path"] = _resolve_path(base_dir, detector.get("model_path"))
+    batch1 = payload.get("batch1")
+    if isinstance(batch1, dict) and "output_root" in batch1:
+        batch1["output_root"] = _resolve_path(base_dir, batch1.get("output_root"))
+    return payload
+
+
+def _resolve_batch2_paths(payload: dict[str, Any], config_path: Path) -> dict[str, Any]:
+    base_dir = config_path.parent
+    batch2 = payload.get("batch2")
+    if isinstance(batch2, dict) and "output_root" in batch2:
+        batch2["output_root"] = _resolve_path(base_dir, batch2.get("output_root"))
+
+    for section_name in ("patchcore", "efficientad"):
+        section = payload.get(section_name)
+        if not isinstance(section, dict):
+            continue
+        for key in (
+            "dataset_root",
+            "bundle_root",
+            "checkpoint_path",
+            "metadata_path",
+            "normal_train_dir",
+            "val_good_dir",
+            "val_bad_dir",
+            "test_good_dir",
+            "test_bad_dir",
+            "external_root",
+            "plantvillage_dir",
+            "plantdoc_dir",
+            "teacher_weights_dir",
+            "imagenette_dir",
+        ):
+            if key in section:
+                section[key] = _resolve_path(base_dir, section.get(key))
+    return payload
+
+
 def load_settings(path: Optional[Union[str, Path]] = None) -> PipelineSettings:
     if path is None:
         path = Path(__file__).with_name("default.yaml")
@@ -304,6 +365,7 @@ def load_batch1_settings(path: Optional[Union[str, Path]] = None) -> Batch1Confi
     else:
         path = Path(path)
     payload: dict[str, Any] = yaml.safe_load(path.read_text()) or {}
+    payload = _resolve_batch1_paths(payload, path)
     return Batch1Config.model_validate(payload)
 
 
@@ -313,4 +375,5 @@ def load_batch2_settings(path: Optional[Union[str, Path]] = None) -> Batch2Confi
     else:
         path = Path(path)
     payload: dict[str, Any] = yaml.safe_load(path.read_text()) or {}
+    payload = _resolve_batch2_paths(payload, path)
     return Batch2Config.model_validate(payload)

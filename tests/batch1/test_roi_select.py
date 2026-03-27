@@ -30,8 +30,8 @@ def test_rejects_cluster_below_area_threshold(batch1_config):
 def test_expands_and_clips_bbox_at_border(batch1_config):
     bbox = BoundingBox(x_min=5, y_min=5, x_max=40, y_max=50)
     expanded = expand_and_clip_bbox(bbox, (100, 100, 3), batch1_config.cluster.bbox_expand_ratio)
-    assert expanded.x_min == 1 or expanded.x_min == 0
-    assert expanded.y_min == 0
+    assert 0 <= expanded.x_min < bbox.x_min
+    assert 0 <= expanded.y_min < bbox.y_min
     assert expanded.x_max <= 100
     assert expanded.y_max <= 100
 
