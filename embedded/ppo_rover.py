@@ -2,9 +2,18 @@
 """
 Online PPO self-driving rover controller (pure numpy).
 
-State  : [rf_L, rf_F, rf_R] — 3 normalised ultrasonic readings
-Actions: 9 discrete (left_motor, right_motor) combinations
-Safety : hard deterministic override that fires before every motor command
+Observation (16-dim, all [0, 1]):
+  [rf_L, rf_F, rf_R,
+   plant_L, plant_C, plant_R,
+   tree_L,  tree_C,  tree_R,
+   hazard_L, hazard_C, hazard_R,
+   crop_L,  crop_R,
+   free_path_C,
+   vx_capped]
+
+Actions : 9 discrete (left_motor x right_motor) combinations
+Safety  : hard deterministic override before every motor command
+Speed   : forward PWM scales with free_path_C in [MIN_FWD_DUTY, MAX_FWD_DUTY] = [30, 80] %
 """
 
 import os
@@ -17,39 +26,44 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from api import RoverAPI
+from vision import VisionPipeline, VisionFeatures, ZERO_VISION
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
-SENSOR_MAX_CM = 30.0   # sensors saturate at this range (cm)
-SAFETY_CM     = 15.0   # hard safety threshold (cm)
-TIMESTEP_S    = 0.10   # control-loop period → 10 Hz
-NOISE_STD     = 0.02   # gaussian noise added to obs during training
+SENSOR_MAX_CM  = 30.0
+SAFETY_CM      = 15.0    # left/right spin threshold (cm)
+FRONT_SAFETY_CM = 25.0   # front backward threshold — larger for more reaction time
+TIMESTEP_S     = 0.05
+NOISE_STD      = 0.02
+MIN_FWD_DUTY   = 30.0    # minimum forward PWM (%)
+MAX_FWD_DUTY   = 40.0    # maximum forward PWM (%)
 
-OBS_DIM    = 3
-HIDDEN_DIM = 32
+OBS_DIM    = 16
+HIDDEN_DIM = 64
 N_ACTIONS  = 9
 
-LR            = 3e-4
-GAMMA         = 0.99
-LAM           = 0.95   # GAE lambda
-CLIP_EPS      = 0.20
-ENTROPY_COEF  = 0.01
-VALUE_COEF    = 0.50
-BUFFER_SIZE   = 32     # steps collected before each PPO update
-PPO_EPOCHS    = 4
-MINIBATCH     = 16
+LR           = 3e-4
+GAMMA        = 0.99
+LAM          = 0.95
+CLIP_EPS     = 0.20
+ENTROPY_COEF = 0.05
+VALUE_COEF   = 0.50
+BUFFER_SIZE  = 64
+PPO_EPOCHS   = 4
+MINIBATCH    = 16
+
+YOLO_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yolov8n.pt')
 
 # ── ACTION TABLE ──────────────────────────────────────────────────────────────
-# Each entry: (left_motor, right_motor)  -1=back  0=stop  +1=forward
 ACTIONS = [
     (-1, -1),   # 0  both backward
-    (-1,  0),   # 1  left back,  right stop
-    (-1,  1),   # 2  spin left   (escape right obstacle)
-    ( 0, -1),   # 3  left stop,  right back
+    (-1,  0),   # 1  left back, right stop
+    (-1,  1),   # 2  spin left
+    ( 0, -1),   # 3  left stop, right back
     ( 0,  0),   # 4  full stop
-    ( 0,  1),   # 5  left stop,  right forward
-    ( 1, -1),   # 6  spin right  (escape left obstacle)
-    ( 1,  0),   # 7  left forward, right stop
-    ( 1,  1),   # 8  both forward  ← target behaviour
+    ( 0,  1),   # 5  gentle right turn
+    ( 1, -1),   # 6  spin right
+    ( 1,  0),   # 7  gentle left turn
+    ( 1,  1),   # 8  both forward
 ]
 
 ACT_BACKWARD   = 0
@@ -57,26 +71,25 @@ ACT_SPIN_LEFT  = 2
 ACT_SPIN_RIGHT = 6
 ACT_FORWARD    = 8
 
+# Actions that move backward voluntarily (blocked unless safety triggers)
+_VOLUNTARY_BACKWARD = {0, 1, 3}  # both-back, left-back, right-back
+
 _CMD = {-1: 'backward', 0: 'stop', 1: 'forward'}
 
 
-# ── ACTOR-CRITIC (pure numpy) ─────────────────────────────────────────────────
+# ── ACTOR-CRITIC ──────────────────────────────────────────────────────────────
 class ActorCritic:
-    """
-    Shared MLP:  Linear(3→32) → ReLU → { Actor: Linear(32→9),
-                                           Critic: Linear(32→1) }
-    Trained with Adam + PPO clipped surrogate.
-    """
+    """Linear(16->64)->ReLU->{ Actor: Linear(64->9), Critic: Linear(64->1) }"""
 
-    def __init__(self, lr: float = LR):
-        rng = np.random.default_rng(0)
+    def __init__(self, lr=LR):
+        rng   = np.random.default_rng(0)
+        scale = np.sqrt(2.0 / OBS_DIM)
 
-        # Weight init: orthogonal-style for body, tiny for heads
-        self.W1 = rng.standard_normal((OBS_DIM, HIDDEN_DIM)) * np.sqrt(2.0 / OBS_DIM)
+        self.W1 = rng.standard_normal((OBS_DIM,    HIDDEN_DIM)) * scale
         self.b1 = np.zeros(HIDDEN_DIM)
-        self.Wa = rng.standard_normal((HIDDEN_DIM, N_ACTIONS)) * 0.01
+        self.Wa = rng.standard_normal((HIDDEN_DIM, N_ACTIONS))  * 0.01
         self.ba = np.zeros(N_ACTIONS)
-        self.Wv = rng.standard_normal((HIDDEN_DIM, 1)) * 1.0
+        self.Wv = rng.standard_normal((HIDDEN_DIM, 1))          * 1.0
         self.bv = np.zeros(1)
 
         self._params = [self.W1, self.b1, self.Wa, self.ba, self.Wv, self.bv]
@@ -85,9 +98,7 @@ class ActorCritic:
         self._t = 0
         self.lr = lr
 
-    # ── Forward ──────────────────────────────────────────────────────────────
-    def _fwd(self, x: np.ndarray):
-        """x: (B, 3).  Returns logits(B,9), values(B,), h(B,H), h_pre(B,H)."""
+    def _fwd(self, x):
         h_pre  = x @ self.W1 + self.b1
         h      = np.maximum(0.0, h_pre)
         logits = h @ self.Wa + self.ba
@@ -95,15 +106,11 @@ class ActorCritic:
         return logits, values, h, h_pre
 
     @staticmethod
-    def _softmax(logits: np.ndarray) -> np.ndarray:
+    def _softmax(logits):
         e = np.exp(logits - logits.max(axis=1, keepdims=True))
         return e / e.sum(axis=1, keepdims=True)
 
-    def act(self, obs: np.ndarray):
-        """
-        Single inference step.
-        obs: (3,)  →  action_idx (int), log_prob (float), value (float)
-        """
+    def act(self, obs):
         x = obs[None].astype(np.float32)
         logits, values, _, _ = self._fwd(x)
         probs      = self._softmax(logits)[0]
@@ -111,62 +118,40 @@ class ActorCritic:
         log_prob   = float(np.log(probs[action_idx] + 1e-8))
         return action_idx, log_prob, float(values[0])
 
-    # ── PPO update ───────────────────────────────────────────────────────────
     def update(self, obs_b, act_b, logp_old_b, ret_b, adv_b):
-        """One minibatch PPO update (all numpy arrays)."""
         B = len(act_b)
-        x    = obs_b.astype(np.float32)
-        ret  = ret_b.astype(np.float32)
-        adv  = adv_b.astype(np.float32)
+        x   = obs_b.astype(np.float32)
+        ret = ret_b.astype(np.float32)
+        adv = adv_b.astype(np.float32)
 
-        # ── Forward pass ─────────────────────────────────────────────────────
         logits, values, h, h_pre = self._fwd(x)
-        probs     = self._softmax(logits)               # (B, 9)
-        log_probs = np.log(probs + 1e-8)                # (B, 9)
-        logp_new  = log_probs[np.arange(B), act_b]     # (B,)
+        probs     = self._softmax(logits)
+        log_probs = np.log(probs + 1e-8)
+        logp_new  = log_probs[np.arange(B), act_b]
 
         ratio         = np.exp(logp_new - logp_old_b)
         clipped_ratio = np.clip(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS)
-        surr1 = ratio * adv
-        surr2 = clipped_ratio * adv
-        is_clipped = surr1 > surr2                      # where clip is active
+        is_clipped    = (ratio * adv) > (clipped_ratio * adv)
+        entropy       = -(probs * log_probs).sum(axis=1)
 
-        entropy = -(probs * log_probs).sum(axis=1)      # (B,)
+        d_val      = VALUE_COEF * (values - ret) / B
+        d_logp     = np.where(is_clipped, 0.0, -adv * ratio) / B
+        d_logits_e = (ENTROPY_COEF / B) * probs * (log_probs + entropy[:, None])
 
-        # ── Gradients ────────────────────────────────────────────────────────
-
-        # Critic: L_v = VALUE_COEF * 0.5*(v-r)^2
-        d_val = VALUE_COEF * (values - ret) / B         # (B,)
-
-        # Actor PPO surrogate (clipped):
-        # dL/d(logp_new) = -adv * ratio  if not clipped, else 0
-        d_logp = np.where(is_clipped, 0.0, -adv * ratio) / B   # (B,)
-
-        # Entropy bonus: d(-ENTROPY_COEF*H)/d(logits_i) = ENTROPY_COEF * p_i*(log_p_i + H)
-        d_logits_ent = (ENTROPY_COEF / B) * probs * (log_probs + entropy[:, None])
-
-        # Actor gradient through log-softmax:
-        # d(logp_k)/d(logits_i) = delta(i,k) - p_i
-        one_hot = np.zeros((B, N_ACTIONS), dtype=np.float32)
+        one_hot          = np.zeros((B, N_ACTIONS), dtype=np.float32)
         one_hot[np.arange(B), act_b] = 1.0
-        d_logits = d_logp[:, None] * (one_hot - probs) + d_logits_ent   # (B, 9)
+        d_logits         = d_logp[:, None] * (one_hot - probs) + d_logits_e
 
-        # ── Backprop through layers ───────────────────────────────────────────
+        dWa  = h.T @ d_logits
+        dba  = d_logits.sum(axis=0)
+        d_h  = d_logits @ self.Wa.T
+        dWv  = h.T @ d_val[:, None]
+        dbv  = np.array([d_val.sum()])
+        d_h += d_val[:, None] * self.Wv.T
 
-        # Actor head
-        dWa = h.T @ d_logits                            # (H, 9)
-        dba = d_logits.sum(axis=0)                      # (9,)
-        d_h = d_logits @ self.Wa.T                      # (B, H)
-
-        # Critic head
-        dWv = h.T @ d_val[:, None]                      # (H, 1)
-        dbv = np.array([d_val.sum()])                   # (1,)
-        d_h += d_val[:, None] * self.Wv.T               # (B, H)
-
-        # ReLU + input layer
-        d_h_pre = d_h * (h_pre > 0).astype(np.float32)
-        dW1 = x.T @ d_h_pre                            # (3, H)
-        db1 = d_h_pre.sum(axis=0)                      # (H,)
+        d_hp = d_h * (h_pre > 0).astype(np.float32)
+        dW1  = x.T @ d_hp
+        db1  = d_hp.sum(axis=0)
 
         self._adam([dW1, db1, dWa, dba, dWv, dbv])
 
@@ -179,86 +164,133 @@ class ActorCritic:
             self._v[i] = beta2 * self._v[i] + (1 - beta2) * g ** 2
             p -= self.lr * (self._m[i] / bc1) / (np.sqrt(self._v[i] / bc2) + eps)
 
-    # ── Persistence ──────────────────────────────────────────────────────────
-    def save(self, path: str):
+    def save(self, path):
         np.savez(path, W1=self.W1, b1=self.b1,
                  Wa=self.Wa, ba=self.ba, Wv=self.Wv, bv=self.bv)
 
-    def load(self, path: str):
+    def load(self, path):
+        """Returns True on success, False on shape mismatch."""
         d = np.load(path)
-        for name in ('W1', 'b1', 'Wa', 'ba', 'Wv', 'bv'):
+        expected = {
+            'W1': (OBS_DIM, HIDDEN_DIM), 'b1': (HIDDEN_DIM,),
+            'Wa': (HIDDEN_DIM, N_ACTIONS), 'ba': (N_ACTIONS,),
+            'Wv': (HIDDEN_DIM, 1), 'bv': (1,),
+        }
+        for name, shape in expected.items():
+            if name not in d or d[name].shape != shape:
+                return False
+        for name in expected:
             getattr(self, name)[:] = d[name]
+        return True
 
 
 # ── SENSOR HELPERS ────────────────────────────────────────────────────────────
 def _norm(dist_cm):
-    """cm → [0,1].  None (timeout) treated as 0.0 (imminent collision)."""
     if dist_cm is None:
-        return 0.0
+        return 1.0  # timeout = nothing detected = max range
     return float(min(dist_cm, SENSOR_MAX_CM) / SENSOR_MAX_CM)
 
 
-def read_sensors(rover: RoverAPI):
-    """
-    Returns:
-      raw  : (L_cm, F_cm, R_cm)
-      obs  : np.ndarray shape (3,) normalised to [0,1]
-
-    Sensor wiring (from DualUltrasonicArray._normalize_sensor_id):
-      sensor 1 → left,  sensor 2 → right,  sensor 3 → center/front
-    """
+def read_sensors(rover):
     raw = rover.get_ultrasonic()
-    L = raw.get(1) or 0.0
-    F = raw.get(3) or 0.0
-    R = raw.get(2) or 0.0
-    obs = np.array([_norm(L), _norm(F), _norm(R)], dtype=np.float32)
-    return (L, F, R), obs
+    # None (timeout) = nothing in range → treat as max range, not collision
+    L = raw.get(1) if raw.get(1) is not None else SENSOR_MAX_CM
+    F = raw.get(3) if raw.get(3) is not None else SENSOR_MAX_CM
+    R = raw.get(2) if raw.get(2) is not None else SENSOR_MAX_CM
+    return (L, F, R), np.array([_norm(L), _norm(F), _norm(R)], dtype=np.float32)
+
+
+# ── OBSERVATION BUILDER ───────────────────────────────────────────────────────
+def build_obs(sensor_obs, vf, vx_capped):
+    return np.array([
+        sensor_obs[0], sensor_obs[1], sensor_obs[2],
+        vf.plant_L,    vf.plant_C,    vf.plant_R,
+        vf.tree_L,     vf.tree_C,     vf.tree_R,
+        vf.hazard_L,   vf.hazard_C,   vf.hazard_R,
+        vf.crop_L,     vf.crop_R,
+        vf.free_path_C,
+        vx_capped,
+    ], dtype=np.float32)
 
 
 # ── SAFETY OVERRIDE ───────────────────────────────────────────────────────────
-def safety_override(raw_L: float, raw_F: float, raw_R: float):
-    """
-    Returns (action_idx | None, triggered: bool).
-    Priority order: front > left > right.
-    """
-    if raw_F < SAFETY_CM:
-        return ACT_BACKWARD, True    # obstacle ahead  → reverse
+def safety_override(raw_L, raw_F, raw_R):
+    # Backward ONLY when front sensor detects danger
+    if raw_F < FRONT_SAFETY_CM:
+        return ACT_BACKWARD,   True
+    # Spin away from left/right obstacles
     if raw_L < SAFETY_CM:
-        return ACT_SPIN_RIGHT, True  # left obstacle   → spin right
+        return ACT_SPIN_RIGHT, True
     if raw_R < SAFETY_CM:
-        return ACT_SPIN_LEFT, True   # right obstacle  → spin left
+        return ACT_SPIN_LEFT,  True
     return None, False
 
 
+# ── HAZARD STEER OVERRIDE ────────────────────────────────────────────────────
+HAZARD_STEER_THR = 0.25  # min hazard_C score to trigger steering
+
+def hazard_steer_override(vf):
+    """
+    When a hazard (person/chair/table) is detected ahead, spin around it
+    instead of reversing. Steers toward the clearer side.
+    Returns (action_idx | None, triggered: bool).
+    """
+    if vf.hazard_C < HAZARD_STEER_THR:
+        return None, False
+    # Spin toward the side with less hazard
+    if vf.hazard_L <= vf.hazard_R:
+        return ACT_SPIN_LEFT, True   # less hazard on left → spin left
+    else:
+        return ACT_SPIN_RIGHT, True  # less hazard on right → spin right
+
+
 # ── REWARD ────────────────────────────────────────────────────────────────────
-def compute_reward(raw_sensors, action_idx: int, safety_triggered: bool) -> float:
+def compute_reward(raw_sensors, vf, action_idx, safety_triggered):
     raw_L, raw_F, raw_R = raw_sensors
     left_cmd, right_cmd = ACTIONS[action_idx]
+    r = 0.0
 
-    # Smooth proximity penalty: 0 at max range, -0.5 when touching
-    valid = [d for d in (raw_L, raw_F, raw_R) if d > 0]
-    min_dist = min(valid) if valid else 0.0
-    prox = -max(0.0, (SENSOR_MAX_CM - min_dist) / SENSOR_MAX_CM) * 0.5
-
-    # Motion reward
+    # 1. Forward motion
     if left_cmd == 1 and right_cmd == 1:
-        motion = 1.0     # full forward
-    elif left_cmd == 1 or right_cmd == 1:
-        motion = 0.3     # partial forward
-    elif left_cmd == 0 and right_cmd == 0:
-        motion = -0.2    # idle
-    elif left_cmd == -1 and right_cmd == -1:
-        motion = -0.5    # full reverse
-    else:
-        motion = 0.0     # turning
+        r += 0.1
 
-    safety_penalty = -2.0 if safety_triggered else 0.0
+    # 2. Plant / tree alignment (YOLO)
+    r += 0.2 * (1.0 - abs(vf.plant_L - vf.plant_R))
+    r += 0.2 * (1.0 - abs(vf.tree_L  - vf.tree_R))
+    r += 0.2 * (vf.plant_C + vf.tree_C)
 
-    return motion + prox + safety_penalty
+    # 3. Crop-row alignment (OpenCV)
+    r += 0.2 * (1.0 - abs(vf.crop_L - vf.crop_R))
+
+    # 4. Free path ahead
+    r += 0.2 * vf.free_path_C
+
+    # 5. Steering toward bio structures
+    left_bio  = vf.plant_L + vf.tree_L
+    right_bio = vf.plant_R + vf.tree_R
+    if left_bio  > right_bio and (left_cmd == -1 and right_cmd ==  1):
+        r += 0.1   # spinning left toward left plants
+    if right_bio > left_bio  and (left_cmd ==  1 and right_cmd == -1):
+        r += 0.1   # spinning right toward right plants
+
+    # 6. Hazard penalty
+    r -= 0.5 * (vf.hazard_L + vf.hazard_C + vf.hazard_R)
+
+    # 7. Backward penalty — discourage reversing unless safety-triggered
+    if left_cmd == -1 and right_cmd == -1 and not safety_triggered:
+        r -= 0.5   # both motors backward
+    elif (left_cmd == -1 or right_cmd == -1) and not safety_triggered:
+        r -= 0.2   # one motor backward (partial reverse)
+
+    # 8. Ultrasonic danger zone (rf_F < 0.2 normalised)
+    if _norm(raw_F) < 0.2:
+        r -= 1.0
+
+    return r
 
 
 # ── GAE ───────────────────────────────────────────────────────────────────────
-def compute_gae(rewards, values, next_value: float):
+def compute_gae(rewards, values, next_value):
     T   = len(rewards)
     adv = np.zeros(T, dtype=np.float32)
     gae = 0.0
@@ -268,37 +300,49 @@ def compute_gae(rewards, values, next_value: float):
         gae   = delta + GAMMA * LAM * gae
         adv[t] = gae
     returns = adv + np.array(values, dtype=np.float32)
-    adv = (adv - adv.mean()) / (adv.std() + 1e-8)   # normalise
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
     return adv, returns
 
 
+def fwd_duty(free_path_C):
+    # Scale forward PWM with path clarity: 30% (blocked) -> 80% (clear)
+    return MIN_FWD_DUTY + (MAX_FWD_DUTY - MIN_FWD_DUTY) * float(free_path_C)
+
+
+def action_to_vx(action_idx, duty=None):
+    if duty is None:
+        duty = MIN_FWD_DUTY
+    lc, rc = ACTIONS[action_idx]
+    return duty / 100.0 if (lc == 1 and rc == 1) else 0.0
+
+
 # ── CONTROL LOOP ──────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s  %(message)s',
-    datefmt='%H:%M:%S',
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(message)s',
+                    datefmt='%H:%M:%S')
 log = logging.getLogger('ppo_rover')
 
 CHECKPOINT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ppo_weights.npz')
 
 
 def main():
-    rover = RoverAPI()
-    model = ActorCritic()
+    rover  = RoverAPI()
+    model  = ActorCritic()
+    vision = VisionPipeline(model_path=YOLO_MODEL)
 
     if os.path.exists(CHECKPOINT):
-        model.load(CHECKPOINT)
-        log.info(f'Resumed from checkpoint: {CHECKPOINT}')
+        if model.load(CHECKPOINT):
+            log.info(f'Resumed from checkpoint: {CHECKPOINT}')
+        else:
+            log.warning('Checkpoint shapes mismatch (obs_dim changed) — starting fresh.')
     else:
-        log.info('No checkpoint found — training from scratch')
+        log.info('No checkpoint — training from scratch.')
 
     obs_buf, act_buf, logp_buf, rew_buf, val_buf = [], [], [], [], []
 
-    step          = 0
-    ep_reward     = 0.0
-    safety_count  = 0
-    running       = True
+    step         = 0
+    ep_reward    = 0.0
+    safety_count = 0
+    running      = True
 
     def _stop(sig, frame):
         nonlocal running
@@ -306,55 +350,70 @@ def main():
 
     signal.signal(signal.SIGINT,  _stop)
     signal.signal(signal.SIGTERM, _stop)
-
     log.info('PPO rover online. Ctrl-C to stop.')
 
     try:
         while running:
             t0 = time.monotonic()
 
-            # ── 1. Read sensors ───────────────────────────────────────────────
-            (raw_L, raw_F, raw_R), obs = read_sensors(rover)
+            # 1. Ultrasonic sensors
+            (raw_L, raw_F, raw_R), sensor_obs = read_sensors(rover)
 
-            # ── 2. Noisy observation for policy ──────────────────────────────
+            # 2. Camera + vision pipeline
+            try:
+                vf = vision.update(np.array(rover.getframe(), dtype=np.uint8))
+            except Exception:
+                vf = ZERO_VISION
+
+            # 3. Build 16-dim observation
+            vx_capped = action_to_vx(act_buf[-1], fwd_duty(vf.free_path_C)) if act_buf else 0.0
+            obs = build_obs(sensor_obs, vf, vx_capped)
             obs_n = np.clip(
                 obs + np.random.normal(0, NOISE_STD, OBS_DIM).astype(np.float32),
                 0.0, 1.0,
             )
 
-            # ── 3. PPO action ─────────────────────────────────────────────────
+            # 4. PPO action
             action_idx, log_prob, value = model.act(obs_n)
 
-            # ── 4. Safety override ────────────────────────────────────────────
+            # 5. Safety override (ultrasonic — highest priority)
             safe_act, triggered = safety_override(raw_L, raw_F, raw_R)
             if triggered:
-                action_idx = safe_act
+                action_idx    = safe_act
                 safety_count += 1
+            else:
+                # Block voluntary backward — only safety may reverse
+                if action_idx in _VOLUNTARY_BACKWARD:
+                    action_idx = ACT_FORWARD
+                # Hazard steer (YOLO — second priority)
+                hazard_act, hazard_triggered = hazard_steer_override(vf)
+                if hazard_triggered:
+                    action_idx = hazard_act
 
-            # ── 5. Send motor command ─────────────────────────────────────────
+            # 6. Drive: forward PWM scales 30->80% with path clarity
             lc, rc = ACTIONS[action_idx]
-            rover.drive(_CMD[lc], _CMD[rc])
+            duty = fwd_duty(vf.free_path_C)
+            rover.drive(
+                _CMD[lc], _CMD[rc],
+                left_speed  = duty if lc == 1 else 100.0,
+                right_speed = duty if rc == 1 else 100.0,
+            )
 
-            # ── 6. Reward ─────────────────────────────────────────────────────
-            reward    = compute_reward((raw_L, raw_F, raw_R), action_idx, triggered)
+            # 7. Reward
+            reward     = compute_reward((raw_L, raw_F, raw_R), vf, action_idx, triggered)
             ep_reward += reward
 
-            # ── 7. Buffer ─────────────────────────────────────────────────────
-            obs_buf.append(obs_n)
-            act_buf.append(action_idx)
-            logp_buf.append(log_prob)
-            rew_buf.append(reward)
-            val_buf.append(value)
+            obs_buf.append(obs_n); act_buf.append(action_idx)
+            logp_buf.append(log_prob); rew_buf.append(reward); val_buf.append(value)
             step += 1
 
-            # ── 8. PPO update every BUFFER_SIZE steps ─────────────────────────
+            # 8. PPO update
             if len(obs_buf) >= BUFFER_SIZE:
-                # Bootstrap value
-                _, next_obs = read_sensors(rover)
+                (_, nF, _), ns_obs = read_sensors(rover)
+                next_obs = build_obs(ns_obs, ZERO_VISION, action_to_vx(act_buf[-1]))
                 _, next_val, _ = model.act(next_obs)
 
                 adv, returns = compute_gae(rew_buf, val_buf, next_val)
-
                 obs_arr  = np.stack(obs_buf)
                 act_arr  = np.array(act_buf,  dtype=np.int32)
                 logp_arr = np.array(logp_buf, dtype=np.float32)
@@ -367,20 +426,19 @@ def main():
                                      logp_arr[mb], returns[mb], adv[mb])
 
                 log.info(
-                    f'step={step:6d}  '
-                    f'rew={ep_reward:+7.2f}  '
-                    f'safety={safety_count:3d}  '
-                    f'sensors=({raw_L:5.1f},{raw_F:5.1f},{raw_R:5.1f})cm  '
-                    f'cmd=({_CMD[lc][:3]},{_CMD[rc][:3]})'
+                    f'step={step:6d}  rew={ep_reward:+7.2f}  safe={safety_count:3d}  '
+                    f'us=({raw_L:5.1f},{raw_F:5.1f},{raw_R:5.1f})cm  '
+                    f'plant=({vf.plant_L:.2f},{vf.plant_C:.2f},{vf.plant_R:.2f})  '
+                    f'haz=({vf.hazard_L:.2f},{vf.hazard_C:.2f},{vf.hazard_R:.2f})  '
+                    f'crop=({vf.crop_L:.2f},{vf.crop_R:.2f})  '
+                    f'free={vf.free_path_C:.2f}  cmd=({_CMD[lc][:3]},{_CMD[rc][:3]})'
                 )
-
                 model.save(CHECKPOINT)
                 obs_buf.clear(); act_buf.clear(); logp_buf.clear()
-                rew_buf.clear(); val_buf.clear()
-                ep_reward = 0.0
-                safety_count = 0
+                rew_buf.clear();  val_buf.clear()
+                ep_reward = 0.0;  safety_count = 0
 
-            # ── 9. Pace loop ──────────────────────────────────────────────────
+            # 9. Pace loop
             elapsed = time.monotonic() - t0
             slack   = TIMESTEP_S - elapsed
             if slack > 0:
@@ -390,7 +448,7 @@ def main():
         rover.stop_motors()
         rover.close()
         model.save(CHECKPOINT)
-        log.info(f'Shutdown after {step} steps. Weights saved to {CHECKPOINT}')
+        log.info(f'Shutdown after {step} steps. Weights saved -> {CHECKPOINT}')
 
 
 if __name__ == '__main__':
