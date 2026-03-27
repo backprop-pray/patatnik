@@ -27,9 +27,10 @@ class AgriculturalRoverEnv(gym.Env):
         
         self.action_space = spaces.Discrete(9)
         
-        # 3 sensors (front, left, right) + 2 vision if enabled
-        obs_shape = 5 if self.use_vision else 3
-        self.observation_space = spaces.Box(low=0.0, high=5.0, shape=(obs_shape,), dtype=np.float32) 
+        # Sensors (3 rfs) + Physics (5) + Obstacle Vector (3: dist, lateral, class) + 2 vision if enabled
+        obs_shape = 3 + 5 + 3 + (2 if self.use_vision else 0)
+        # Low/High boundaries adjusted for negatives
+        self.observation_space = spaces.Box(low=-10.0, high=10.0, shape=(obs_shape,), dtype=np.float32) 
         
         # Determine device (CUDA, MPS, or CPU)
         self.device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -221,6 +222,66 @@ class AgriculturalRoverEnv(gym.Env):
                 val = 5.0
             obs.append(val)
             
+        # ————————————————————————————————————————
+        # 📂 Embedded Physics States
+        # ————————————————————————————————————————
+        curr_x = self.data.qpos[0]
+        curr_y = self.data.qpos[1]
+        qw, qz = self.data.qpos[3], self.data.qpos[6]
+        
+        # 1. Orientation (sin/cos yaw)
+        sin_y = 2 * qw * qz
+        cos_y = qw**2 - qz**2
+        obs.append(sin_y)
+        obs.append(cos_y)
+        
+        # 2. Local Velocity (Forward/Lateral)
+        world_vx, world_vy = self.data.qvel[0], self.data.qvel[1]
+        vx_local = world_vx * cos_y + world_vy * sin_y
+        vy_local = -world_vx * sin_y + world_vy * cos_y
+        obs.append(vx_local)
+        obs.append(vy_local)
+        
+        # 3. Precise Lane Offset
+        target_y = np.sin(curr_x * self.wave_freq) * self.wave_amp
+        offset = curr_y - target_y
+        obs.append(offset)
+        
+        # ————————————————————————————————————————
+        # 📂 Semantic Vision Obstacle Vector (Efficiency hack for "going around")
+        # ————————————————————————————————————————
+        obs_dist = 5.0
+        obs_lat_error = 0.0
+        obs_is_person = 0.0
+        
+        # Search for any dynamic obstacle in front of the rover
+        min_d = 5.0
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            # Identify if contact or proximity sensor sees an obstacle
+            pass # We'll use a geom pos search for lower noise training
+            
+        # Efficiently find the closest 'obstacle' geom
+        for i in range(self.model.ngeom):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, i)
+            if name and ("obstacle" in name or "person" in name):
+                g_pos = self.data.geom_xpos[i]
+                rel = g_pos[:2] - np.array([curr_x, curr_y])
+                d = np.linalg.norm(rel)
+                if d < min_d:
+                    min_d = d
+                    obs_dist = d
+                    # Relative lateral shift to the obstacle
+                    obs_lat_error = -rel[0] * sin_y + rel[1] * cos_y
+                    if "person" in name:
+                        obs_is_person = 1.0
+        
+        obs.append(obs_dist)
+        obs.append(obs_lat_error)
+        obs.append(obs_is_person)
+        
+        # ————————————————————————————————————————
+
         # Skip expensive segmentation for Fast Hackathon Mode
         if not self.use_vision:
             return np.array(obs, dtype=np.float32)
