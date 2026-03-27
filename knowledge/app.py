@@ -23,7 +23,6 @@ MODEL_NAME = os.getenv("OPENCLIP_MODEL", "ViT-B-32")
 PRETRAINED = os.getenv("OPENCLIP_PRETRAINED", "laion2b_s34b_b79k")
 
 index: OpenClipRAGIndex | None = None
-has_health_status_column = False
 
 
 @dataclass
@@ -164,27 +163,10 @@ def resolve_reference(hit_path: str, hit_name: str) -> ReferenceRecommendation |
     return reference_by_name.get(hit_name.lower())
 
 
-def detect_health_status_column() -> bool:
-    query = (
-        "SELECT EXISTS ("
-        "SELECT 1 FROM information_schema.columns "
-        "WHERE table_schema = 'public' AND table_name = 'processed_plants' AND column_name = 'health_status'"
-        ")"
-    )
-    with open_db_connection() as conn, conn.cursor() as cur:
-        cur.execute(query)
-        row = cur.fetchone()
-        if not row:
-            return False
-        return bool(row[0])
-
-
 def upsert_processed_plant(
     plant_id: int,
     recommendation: ReferenceRecommendation,
 ) -> None:
-    health_status = "DISEASED" if recommendation.disease else "HEALTHY"
-
     with open_db_connection() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT id FROM public.processed_plants "
@@ -195,57 +177,31 @@ def upsert_processed_plant(
         row = cur.fetchone()
 
         if row:
-            if has_health_status_column:
-                cur.execute(
-                    "UPDATE public.processed_plants "
-                    "SET recommended_action = %s, recommended_action_user_id = %s, health_status = %s "
-                    "WHERE id = %s",
-                    (
-                        recommendation.recommendation,
-                        recommendation.recommended_action_user_id,
-                        health_status,
-                        int(row[0]),
-                    ),
-                )
-            else:
-                cur.execute(
-                    "UPDATE public.processed_plants "
-                    "SET recommended_action = %s, recommended_action_user_id = %s "
-                    "WHERE id = %s",
-                    (
-                        recommendation.recommendation,
-                        recommendation.recommended_action_user_id,
-                        int(row[0]),
-                    ),
-                )
+            cur.execute(
+                "UPDATE public.processed_plants "
+                "SET recommended_action = %s, recommended_action_user_id = %s "
+                "WHERE id = %s",
+                (
+                    recommendation.recommendation,
+                    recommendation.recommended_action_user_id,
+                    int(row[0]),
+                ),
+            )
             conn.commit()
             return
 
-        if has_health_status_column:
-            cur.execute(
-                "INSERT INTO public.processed_plants "
-                "(plant_id, disease, health_status, recommended_action, recommended_action_user_id, created_at) "
-                "VALUES (%s, %s, %s, %s, %s, NOW())",
-                (
-                    plant_id,
-                    recommendation.disease,
-                    health_status,
-                    recommendation.recommendation,
-                    recommendation.recommended_action_user_id,
-                ),
-            )
-        else:
-            cur.execute(
-                "INSERT INTO public.processed_plants "
-                "(plant_id, disease, recommended_action, recommended_action_user_id, created_at) "
-                "VALUES (%s, %s, %s, %s, NOW())",
-                (
-                    plant_id,
-                    recommendation.disease,
-                    recommendation.recommendation,
-                    recommendation.recommended_action_user_id,
-                ),
-            )
+        cur.execute(
+            "INSERT INTO public.processed_plants "
+            "(plant_id, disease, recommended_action, status, recommended_action_user_id, created_at) "
+            "VALUES (%s, %s, %s, %s, %s, NOW())",
+            (
+                plant_id,
+                recommendation.disease,
+                recommendation.recommendation,
+                None,
+                recommendation.recommended_action_user_id,
+            ),
+        )
 
         conn.commit()
 
@@ -325,7 +281,6 @@ def get_processed_plant_view(processed_plant_id: int) -> ProcessedPlantViewRespo
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global has_health_status_column
     global index
     global reference_by_path
     global reference_by_name
@@ -335,7 +290,6 @@ async def lifespan(_: FastAPI):
         model_name=MODEL_NAME,
         pretrained=PRETRAINED,
     )
-    has_health_status_column = detect_health_status_column()
     image_paths, reference_by_path, reference_by_name = load_reference_catalog()
     index.build_index_from_paths(image_paths)
     yield
