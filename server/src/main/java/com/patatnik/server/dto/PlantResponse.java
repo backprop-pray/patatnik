@@ -16,6 +16,7 @@ public class PlantResponse {
     private String disease;
     private String recommendedAction;
     private Boolean status;
+    private Long processPlantId;
 
     public static PlantResponse fromEntity(Plant plant) {
         ProcessedPlant pp = plant.getProcessedPlant();
@@ -30,6 +31,7 @@ public class PlantResponse {
             .disease(pp != null ? pp.getDisease() : null)
             .recommendedAction(pp != null ? pp.getRecommendedAction() : null)
             .status(pp != null ? pp.getStatus() : null)
+            .processPlantId(pp != null ? pp.getId(): null)
             .build();
     }
 }

@@ -35,23 +35,23 @@ final class PlantWebSocketService {
         currentUserId = userId
 
         guard !isConnected else {
-            print("[WS] Already connected, skipping connect()")
+            print("[WS] ⚠️ Already connected, skipping connect()")
             return
         }
 
         Task {
             guard let token = await APIClient.shared.getToken() else {
-                print("[WS] No JWT token available — skipping WebSocket connect")
+                print("[WS] ❌ No JWT token available — skipping WebSocket connect")
                 return
             }
 
             let wsURL = AppConfig.wsURL
             guard let url = URL(string: wsURL) else {
-                print("[WS] Invalid WebSocket URL: \(wsURL)")
+                print("[WS] ❌ Invalid WebSocket URL: \(wsURL)")
                 return
             }
 
-            print("[WS] Connecting to \(url) for userId: \(userId)")
+            print("[WS] 🔵 Connecting to \(url) for userId: \(userId)")
 
             webSocketTask?.cancel(with: .goingAway, reason: nil)
 
@@ -62,7 +62,7 @@ final class PlantWebSocketService {
 
             let host = url.host ?? "morzio.com"
             let connectFrame = StompFrame.connect(host: host, token: token)
-            print("[WS] Sending CONNECT frame:\n\(connectFrame.replacingOccurrences(of: "\0", with: "\\0"))")
+            print("[WS] 📤 Sending CONNECT frame")
             await sendAsync(frame: connectFrame)
 
             startReceiveLoop()
@@ -95,11 +95,11 @@ final class PlantWebSocketService {
         receiveLoopTask?.cancel()
         receiveLoopTask = Task { [weak self] in
             guard let self else { return }
-            print("[WS] Receive loop started")
+            print("[WS] 🟢 Receive loop started")
 
             while !Task.isCancelled {
                 guard let task = self.webSocketTask else {
-                    print("[WS] Receive loop: webSocketTask is nil, exiting")
+                    print("[WS] ❌ Receive loop: webSocketTask is nil, exiting")
                     break
                 }
 
@@ -107,11 +107,18 @@ final class PlantWebSocketService {
                     let message = try await task.receive()
                     await self.handleMessage(message)
                 } catch {
-                    if Task.isCancelled { break }
-                    print("[WS] Receive error: \(error)")
+                    if Task.isCancelled { 
+                        print("[WS] 🟡 Receive loop cancelled by task")
+                        break 
+                    }
+                    print("[WS] ❌ Receive error: \(error)")
+                    print("[WS] ❌ Error type: \(type(of: error))")
+                    print("[WS] ❌ Error description: \(error.localizedDescription)")
+                    
                     if self.isConnected {
                         self.isConnected = false
                         self.stompConnected = false
+                        print("[WS] 🔄 Scheduling reconnect due to error...")
                         self.scheduleReconnect()
                     }
                     break

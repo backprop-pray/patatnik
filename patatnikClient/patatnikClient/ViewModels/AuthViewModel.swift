@@ -21,6 +21,10 @@ class AuthViewModel: ObservableObject {
             self.token = response.token
             currentUser = response.user
             isAuthenticated = true
+            
+            // Clear any stale plant cache data
+            clearPlantCache()
+            
             PlantWebSocketService.shared.connect(userId: response.user.id)
         } catch let error as AuthService.AuthError {
             errorMessage = error.userMessage
@@ -39,6 +43,10 @@ class AuthViewModel: ObservableObject {
             self.token = response.token
             currentUser = response.user
             isAuthenticated = true
+            
+            // Clear any stale plant cache data
+            clearPlantCache()
+            
             PlantWebSocketService.shared.connect(userId: response.user.id)
         } catch let error as AuthService.AuthError {
             errorMessage = error.userMessage
@@ -52,5 +60,22 @@ class AuthViewModel: ObservableObject {
         token = nil
         currentUser = nil
         isAuthenticated = false
+        
+        // Clear plant cache on logout
+        clearPlantCache()
+    }
+    
+    private func clearPlantCache() {
+        // Remove all plant-related UserDefaults cache
+        let defaults = UserDefaults.standard
+        let dictionary = defaults.dictionaryRepresentation()
+        
+        for key in dictionary.keys {
+            if key.hasPrefix("plant_") {
+                defaults.removeObject(forKey: key)
+            }
+        }
+        
+        print("[AuthVM] Cleared plant cache")
     }
 }

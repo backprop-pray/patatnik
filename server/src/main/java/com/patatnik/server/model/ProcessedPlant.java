@@ -39,7 +39,11 @@ public class ProcessedPlant {
 
     private Boolean status;
 
-    public void changeStatus() {
-        this.status = this.status == null || !this.status;
+    public void accept() {
+        this.status = true;
+    }
+
+    public void reject() {
+        this.status = false;
     }
 }

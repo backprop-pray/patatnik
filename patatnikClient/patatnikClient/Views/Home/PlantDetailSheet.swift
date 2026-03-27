@@ -384,8 +384,18 @@ private struct PulsingDot: View {
         LinearGradient(colors: [.blue.opacity(0.6), .green.opacity(0.6)], startPoint: .top, endPoint: .bottom)
             .ignoresSafeArea()
         PlantDetailSheet(
-            plant: Plant(id: 42, latitude: 42.69, longitude: 23.32,
-                         imageUrl: nil, userId: 1, createdAt: "2026-03-12T10:00:00"),
+            plant: Plant(
+                id: 42,
+                latitude: 42.69,
+                longitude: 23.32,
+                imageUrl: nil,
+                userId: 1,
+                createdAt: "2026-03-12T10:00:00",
+                disease: "Tomato — Late blight",
+                recommendedAction: "Rotate crops every 4 years, keep leaves dry",
+                status: false,
+                processedPlantId: 123
+            ),
             onClose: {}
         )
     }

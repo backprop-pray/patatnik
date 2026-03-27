@@ -8,4 +8,7 @@ public interface PlantService {
     PlantResponse createPlant(Double latitude, Double longitude, MultipartFile image, User user);
 
     java.util.List<PlantResponse> getPlantsByUser(User user);
+
+    void accept(Long id, User user);
+    void reject(Long id, String comment, User user);
 }
