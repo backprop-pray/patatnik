@@ -94,6 +94,11 @@ class OpenClipRAGIndex:
         self.image_matrix = self._encode_images(self.image_paths)
         return len(self.image_paths)
 
+    def build_index_from_paths(self, image_paths: Iterable[Path]) -> int:
+        self.image_paths = [Path(p) for p in image_paths]
+        self.image_matrix = self._encode_images(self.image_paths)
+        return len(self.image_paths)
+
     def _top_hits(self, query_vector: np.ndarray, top_k: int) -> list[SearchHit]:
         if self.image_matrix.size == 0:
             return []

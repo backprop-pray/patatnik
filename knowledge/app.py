@@ -18,7 +18,7 @@ from openclip_rag import OpenClipRAGIndex
 
 
 BASE_DIR = Path(__file__).resolve().parent
-IMAGE_DIR = Path(os.getenv("KNOWLEDGE_IMAGE_DIR", BASE_DIR / "test_images"))
+REFERENCE_CACHE_DIR = Path(os.getenv("KNOWLEDGE_CACHE_DIR", "/tmp/patatnik-knowledge-cache"))
 MODEL_NAME = os.getenv("OPENCLIP_MODEL", "ViT-B-32")
 PRETRAINED = os.getenv("OPENCLIP_PRETRAINED", "laion2b_s34b_b79k")
 
@@ -104,12 +104,35 @@ def normalize_image_name_key(path_or_url: str) -> str:
     return Path(unquote(source)).name.lower()
 
 
-def load_reference_catalog() -> tuple[dict[str, ReferenceRecommendation], dict[str, ReferenceRecommendation]]:
+def cache_reference_image(image_url: str, processed_plant_id: int) -> Path:
+    REFERENCE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    parsed = urlparse(image_url)
+    suffix = Path(unquote(parsed.path)).suffix or ".png"
+    local_path = REFERENCE_CACHE_DIR / f"processed_{processed_plant_id}{suffix}"
+
+    if local_path.exists():
+        return local_path
+
+    if parsed.scheme in {"http", "https"}:
+        with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+            response = client.get(image_url)
+            response.raise_for_status()
+            local_path.write_bytes(response.content)
+        return local_path
+
+    source_path = Path(image_url)
+    local_path.write_bytes(source_path.read_bytes())
+    return local_path
+
+
+def load_reference_catalog() -> tuple[list[Path], dict[str, ReferenceRecommendation], dict[str, ReferenceRecommendation]]:
+    image_paths: list[Path] = []
     by_path: dict[str, ReferenceRecommendation] = {}
     by_name: dict[str, ReferenceRecommendation] = {}
 
     query = (
-        "SELECT p.image_url, COALESCE(pp.disease, ''), pp.recommended_action, pp.recommended_action_user_id "
+        "SELECT pp.id, p.image_url, COALESCE(pp.disease, ''), pp.recommended_action, pp.recommended_action_user_id "
         "FROM public.processed_plants pp "
         "JOIN public.plants p ON p.id = pp.plant_id "
         "WHERE p.image_url IS NOT NULL AND p.image_url <> '' "
@@ -119,18 +142,19 @@ def load_reference_catalog() -> tuple[dict[str, ReferenceRecommendation], dict[s
 
     with open_db_connection() as conn, conn.cursor() as cur:
         cur.execute(query)
-        for image_url, disease, recommendation, source_user_id in cur.fetchall():
+        for processed_plant_id, image_url, disease, recommendation, source_user_id in cur.fetchall():
             payload = ReferenceRecommendation(
                 disease=disease,
                 recommendation=recommendation,
                 recommended_action_user_id=int(source_user_id),
             )
-            path_obj = Path(image_url)
-            if path_obj.exists():
-                by_path.setdefault(normalize_image_path_key(str(path_obj)), payload)
-            by_name.setdefault(normalize_image_name_key(image_url), payload)
 
-    return by_path, by_name
+            cached_path = cache_reference_image(image_url, int(processed_plant_id))
+            image_paths.append(cached_path)
+            by_path[normalize_image_path_key(str(cached_path))] = payload
+            by_name[normalize_image_name_key(str(cached_path))] = payload
+
+    return image_paths, by_path, by_name
 
 
 def resolve_reference(hit_path: str, hit_name: str) -> ReferenceRecommendation | None:
@@ -234,13 +258,13 @@ async def lifespan(_: FastAPI):
     global reference_by_name
 
     index = OpenClipRAGIndex(
-        image_dir=IMAGE_DIR,
+        image_dir=REFERENCE_CACHE_DIR,
         model_name=MODEL_NAME,
         pretrained=PRETRAINED,
     )
-    index.build_index()
     has_health_status_column = detect_health_status_column()
-    reference_by_path, reference_by_name = load_reference_catalog()
+    image_paths, reference_by_path, reference_by_name = load_reference_catalog()
+    index.build_index_from_paths(image_paths)
     yield
 
 
@@ -314,7 +338,7 @@ def health() -> dict[str, str | int]:
     return {
         "status": "ok",
         "indexed_images": len(rag.image_paths),
-        "image_dir": str(rag.image_dir),
+        "image_dir": str(REFERENCE_CACHE_DIR),
         "model": rag.model_name,
         "pretrained": rag.pretrained,
         "device": rag.device,
