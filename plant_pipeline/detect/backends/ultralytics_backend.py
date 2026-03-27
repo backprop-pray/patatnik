@@ -65,10 +65,17 @@ class UltralyticsLeafBackend:
                         y_max=int(coords[3]),
                     ),
                     confidence=float(conf),
-                    label=str(label).strip().lower(),
+                    label=self._normalize_label(label),
                 )
             )
         return detections
 
     def close(self) -> None:
         self._model = None
+
+    @staticmethod
+    def _normalize_label(label: Any) -> str:
+        normalized = str(label).strip().lower()
+        if normalized in {"leaf", "plant"}:
+            return normalized
+        return "leaf"

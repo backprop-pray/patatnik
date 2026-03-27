@@ -90,6 +90,7 @@ class Batch1ApiSettings(BaseModel):
 
 
 class Batch2Settings(BaseModel):
+    backend: str = "efficientad"
     output_root: str = "./data/batch2"
     write_anomaly_map: bool = True
     anomaly_map_format: str = "png"
@@ -121,6 +122,42 @@ class Batch2PatchCoreSettings(BaseModel):
     model_name: str = "patchcore"
     model_version: str = "patchcore-wideresnet50-v1"
     allow_inference_fallback: bool = False
+
+
+class Batch2EfficientAdSettings(BaseModel):
+    backend: str = "efficientad"
+    dataset_root: str = "./data/datasets/roi_anomaly_general"
+    bundle_root: str = "./data/models/batch2_efficientad"
+    checkpoint_path: str = ""
+    metadata_path: str = ""
+    normal_train_dir: str = "./data/datasets/roi_anomaly_general/train/good"
+    val_good_dir: str = "./data/datasets/roi_anomaly_general/val/good"
+    val_bad_dir: str = "./data/datasets/roi_anomaly_general/val/bad"
+    test_good_dir: str = "./data/datasets/roi_anomaly_general/test/good"
+    test_bad_dir: str = "./data/datasets/roi_anomaly_general/test/bad"
+    external_root: str = "./data/external"
+    plantvillage_dir: str = "./data/external/PlantVillage-Dataset"
+    plantdoc_dir: str = "./data/external/PlantDoc-Dataset"
+    teacher_weights_dir: str = "./data/external/efficientad/pre_trained"
+    imagenette_dir: str = "./data/external/efficientad/imagenette"
+    image_size: int = 256
+    center_crop: Optional[int] = None
+    train_batch_size: int = 1
+    eval_batch_size: int = 16
+    num_workers: int = 0
+    device: str = "cpu"
+    model_name: str = "efficientad"
+    model_version: str = "efficientad-s-general-v1"
+    model_size: str = "small"
+    teacher_out_channels: int = 384
+    lr: float = 0.0001
+    weight_decay: float = 0.00001
+    padding: bool = False
+    pad_maps: bool = True
+    normalization_method: str = "min_max"
+    max_epochs: int = 200
+    max_steps: int = 70000
+    seed: int = 42
 
 
 class Batch2ThresholdSettings(BaseModel):
@@ -222,6 +259,7 @@ class Batch1Config(BaseModel):
 class Batch2Config(BaseModel):
     batch2: Batch2Settings = Field(default_factory=Batch2Settings)
     patchcore: Batch2PatchCoreSettings = Field(default_factory=Batch2PatchCoreSettings)
+    efficientad: Batch2EfficientAdSettings = Field(default_factory=Batch2EfficientAdSettings)
     thresholds: Batch2ThresholdSettings = Field(default_factory=Batch2ThresholdSettings)
     api: Batch2ApiSettings = Field(default_factory=Batch2ApiSettings)
 

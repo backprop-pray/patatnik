@@ -1,12 +1,47 @@
 batch2:
+  backend: efficientad
   output_root: ./data/batch2
   write_anomaly_map: true
   anomaly_map_format: png
   roi_glob_pattern: "*.png"
+efficientad:
+  backend: efficientad
+  dataset_root: ./data/datasets/roi_anomaly_general
+  bundle_root: ./data/models/batch2_efficientad
+  checkpoint_path: ""
+  metadata_path: ""
+  normal_train_dir: ./data/datasets/roi_anomaly_general/train/good
+  val_good_dir: ./data/datasets/roi_anomaly_general/val/good
+  val_bad_dir: ./data/datasets/roi_anomaly_general/val/bad
+  test_good_dir: ./data/datasets/roi_anomaly_general/test/good
+  test_bad_dir: ./data/datasets/roi_anomaly_general/test/bad
+  external_root: ./data/external
+  plantvillage_dir: ./data/external/PlantVillage-Dataset
+  plantdoc_dir: ./data/external/PlantDoc-Dataset
+  teacher_weights_dir: ./data/external/efficientad/pre_trained
+  imagenette_dir: ./data/external/efficientad/imagenette
+  image_size: 256
+  center_crop:
+  train_batch_size: 1
+  eval_batch_size: 16
+  num_workers: 0
+  device: cpu
+  model_name: efficientad
+  model_version: efficientad-s-general-v1
+  model_size: small
+  teacher_out_channels: 384
+  lr: 0.0001
+  weight_decay: 0.00001
+  padding: false
+  pad_maps: true
+  normalization_method: min_max
+  max_epochs: 200
+  max_steps: 70000
+  seed: 42
 patchcore:
   backend: patchcore
   dataset_root: ./data/datasets/roi_anomaly
-  bundle_root: ./data/models/batch2_patchcore
+  bundle_root: ./goshko/plant_pipeline/params
   checkpoint_path: ""
   metadata_path: ""
   normal_train_dir: ./data/datasets/roi_anomaly/train/good
@@ -28,7 +63,7 @@ patchcore:
   normalization_method: min_max
   device: cpu
   model_name: patchcore
-  model_version: patchcore-wideresnet50-v1
+  model_version: patchcore-wideresnet50-v1-runpod
   allow_inference_fallback: false
 thresholds:
   lower_threshold:

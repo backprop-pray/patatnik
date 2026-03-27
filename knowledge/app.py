@@ -5,6 +5,8 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
+
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from PIL import Image
@@ -72,6 +74,40 @@ def to_response(rag: OpenClipRAGIndex, hits) -> SearchResponse:
         ],
     )
 
+class MobileRecommendationRequest(BaseModel):
+    plant_id: int
+    image_url: str
+
+class MobileRecommendationResponse(BaseModel):
+    plant_id: int
+    disease: str
+    text: str
+
+@app.post("/mobile/recommendation", response_model=MobileRecommendationResponse)
+async def mobile_recommendation(payload: MobileRecommendationRequest) -> MobileRecommendationResponse:
+    rag = get_index()
+
+    try:
+        async with httpx.AsyncClient() as client:
+            img_resp = await client.get(payload.image_url, timeout=15.0)
+            pil_image = Image.open(io.BytesIO(img_resp.content)).convert("RGB")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Could not download image: {e}")
+
+    hits = rag.search_image_pil(pil_image, top_k=1)
+
+    if not hits:
+        raise HTTPException(status_code=500, detail="No results from index")
+
+    top = hits[0]
+    disease = top.image_name.rsplit(".", 1)[0].replace("_", " ").replace("-", " ").title()
+    text = f"Detected: {disease}. Score: {top.score:.2f}."
+
+    return MobileRecommendationResponse(
+        plant_id=payload.plant_id,
+        disease=disease[:30],
+        text=text[:50]
+    )
 
 @app.get("/health")
 def health() -> dict[str, str | int]:

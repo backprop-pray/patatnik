@@ -16,15 +16,15 @@ quality_batch1:
   reject_on_vegetation_fraction: false
 detector_batch1:
   backend: ultralytics_leaf
-  model_path: ./models/yolo11x_leaf.pt
+  model_path: ./models/foduu_plant_leaf_yolov8s_best.pt
   device: cpu
-  min_confidence: 0.15
+  min_confidence: 0.25
   allowed_labels:
     - leaf
     - plant
   warmup_runs: 3
   benchmark_runs: 20
-  licensing_note: "Ultralytics-based backend assumes AGPL-3.0 compliance or separate commercial licensing."
+  licensing_note: "Ultralytics-based backend with vendored pretrained weights from foduucom/plant-leaf-detection-and-classification."
 cluster:
   merge_iou_threshold: 0.15
   merge_distance_threshold: 0.02

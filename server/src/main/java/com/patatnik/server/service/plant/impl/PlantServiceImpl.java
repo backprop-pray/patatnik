@@ -7,6 +7,8 @@ import com.patatnik.server.model.User;
 import com.patatnik.server.repository.PlantRepository;
 import com.patatnik.server.service.CloudinaryService;
 import com.patatnik.server.service.plant.PlantService;
+import com.patatnik.server.service.recomendation.RecommendationService;
+
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
@@ -22,6 +24,7 @@ public class PlantServiceImpl implements PlantService {
     private final PlantRepository plantRepository;
     private final CloudinaryService cloudinaryService;
     private final SimpMessagingTemplate messagingTemplate;
+    private final RecommendationService recommendationService;
 
     @Override
     public PlantResponse createPlant(Double latitude, Double longitude, MultipartFile image, User user) {
@@ -52,6 +55,8 @@ public class PlantServiceImpl implements PlantService {
                 response
         );
         System.out.println("THE MESSAGE IS SEND");
+
+        recommendationService.requestAnalysis(plant, user);
 
         return response;
     }

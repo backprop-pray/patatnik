@@ -8,6 +8,7 @@ import pytest
 from plant_pipeline.anomaly.dataset import (
     ensure_dataset_layout,
     ingest_rois,
+    install_general_plant_dataset,
     load_dataset_manifest,
     validate_dataset_layout,
 )
@@ -44,3 +45,28 @@ def test_ingest_rois_uses_unique_stable_names_and_manifest(tmp_path: Path):
 def test_validate_dataset_rejects_incomplete_root(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         validate_dataset_layout(tmp_path / "missing")
+
+
+def test_install_general_plant_dataset_builds_expected_splits(efficientad_config, tmp_path: Path):
+    plantvillage_root = Path(efficientad_config.efficientad.plantvillage_dir) / "raw" / "color"
+    plantdoc_root = Path(efficientad_config.efficientad.plantdoc_dir)
+    for directory in [
+        plantvillage_root / "Apple___healthy",
+        plantvillage_root / "Apple___scab",
+        plantdoc_root / "train" / "Tomato leaf bacterial spot",
+        plantdoc_root / "test" / "Tomato leaf bacterial spot",
+    ]:
+        directory.mkdir(parents=True, exist_ok=True)
+    for idx in range(10):
+        (plantvillage_root / "Apple___healthy" / f"healthy_{idx}.jpg").write_bytes(b"h")
+        (plantvillage_root / "Apple___scab" / f"bad_{idx}.jpg").write_bytes(b"b")
+        (plantdoc_root / "train" / "Tomato leaf bacterial spot" / f"train_bad_{idx}.jpg").write_bytes(b"t")
+        (plantdoc_root / "test" / "Tomato leaf bacterial spot" / f"test_bad_{idx}.jpg").write_bytes(b"u")
+
+    manifest = install_general_plant_dataset(efficientad_config.efficientad)
+    assert manifest["split_counts"]["train/good"] > 0
+    assert manifest["split_counts"]["val/good"] > 0
+    assert manifest["split_counts"]["test/good"] > 0
+    assert manifest["split_counts"]["val/bad"] > 0
+    assert manifest["split_counts"]["test/bad"] > 0
+    assert len(load_dataset_manifest(Path(efficientad_config.efficientad.dataset_root))["entries"]) > 0

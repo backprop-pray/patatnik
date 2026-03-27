@@ -1,6 +1,7 @@
 FROM nvidia/cuda:12.8.0-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
+ARG PYTORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common gnupg \
@@ -16,7 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV VENV_DIR=/opt/venv
 RUN python3.13 -m venv "$VENV_DIR" && \
-    "$VENV_DIR/bin/python" -m pip install --upgrade pip
+    "$VENV_DIR/bin/python" -m pip install --upgrade pip && \
+    "$VENV_DIR/bin/python" -m pip install --upgrade \
+      --index-url "$PYTORCH_INDEX_URL" \
+      torch torchvision torchaudio
 ENV PATH="$VENV_DIR/bin:$PATH" VIRTUAL_ENV="$VENV_DIR"
 
 RUN printf '%s\n' \

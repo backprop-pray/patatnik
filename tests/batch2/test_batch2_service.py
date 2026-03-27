@@ -40,3 +40,15 @@ def test_folder_inference_counts_failures(batch2_config, good_roi, bad_roi, tmp_
         assert result.failed_count == 1
     finally:
         service.close()
+
+
+def test_service_selects_efficientad_backend(efficientad_config, monkeypatch):
+    monkeypatch.setattr(
+        "plant_pipeline.anomaly.backends.efficientad_backend.EfficientAdBackend.load",
+        lambda self: setattr(self, "_loaded", True),
+    )
+    service = Batch2Service(efficientad_config)
+    try:
+        assert service.backend.name == "efficientad"
+    finally:
+        service.close()
