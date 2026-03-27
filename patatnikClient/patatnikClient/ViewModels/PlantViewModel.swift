@@ -65,11 +65,16 @@ class PlantViewModel: ObservableObject {
         print("[PlantVM] Binding onPlantReceived callback")
         PlantWebSocketService.shared.onPlantReceived = { [weak self] plant in
             guard let self else { return }
-            if !self.plants.contains(where: { $0.id == plant.id }) {
+            
+            // Check if plant already exists
+            if let existingIndex = self.plants.firstIndex(where: { $0.id == plant.id }) {
+                // Update existing plant with new data (includes disease, recommendedAction, status)
+                self.plants[existingIndex] = plant
+                print("[PlantVM] Plant updated: id=\(plant.id)")
+            } else {
+                // Add new plant
                 self.plants.insert(plant, at: 0)
                 print("[PlantVM] Plant added to map: id=\(plant.id)")
-            } else {
-                print("[PlantVM] Plant id=\(plant.id) already exists, skipping")
             }
         }
     }

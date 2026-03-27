@@ -111,6 +111,12 @@ struct HomeView: View {
                 PlantWebSocketService.shared.connect(userId: userId)
             }
         }
+        .onAppear {
+            // Refresh plants when view appears to get latest data
+            Task {
+                await plantVM.loadPlants(token: authVM.token)
+            }
+        }
         .onDisappear {
             plantVM.stopListening()
         }

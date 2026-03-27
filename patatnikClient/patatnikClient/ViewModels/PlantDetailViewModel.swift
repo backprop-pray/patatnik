@@ -1,8 +1,15 @@
 import SwiftUI
+import SwiftUI
 import Combine
 
 private nonisolated struct RespondBody: Encodable, Sendable {
     let accepted: Bool
+}
+
+private nonisolated struct EmptyBody: Encodable, Sendable {}
+
+private nonisolated struct RejectBody: Encodable, Sendable {
+    let comment: String
 }
 
 private nonisolated struct UpdateRecommendationBody: Encodable, Sendable {
@@ -66,7 +73,46 @@ class PlantDetailViewModel: ObservableObject {
         responseAccepted = UserDefaults.standard.bool(forKey: acceptedKey)
         opinionSubmitted = UserDefaults.standard.bool(forKey: opinionKey)
         
-        // Try to load cached recommendation data
+        // Check if plant has recommendation data from backend
+        if let disease = plant.disease, 
+           let recommendedAction = plant.recommendedAction,
+           !disease.isEmpty,
+           !recommendedAction.isEmpty {
+            
+            // Use data from backend
+            estimatedDisease = disease
+            recommendation = recommendedAction
+            
+            // Get processedPlantId from backend data
+            if let processedPlantId = plant.processedPlantId {
+                self.processedPlantId = processedPlantId
+                UserDefaults.standard.set(processedPlantId, forKey: "plant_\(plant.id)_processed_plant_id")
+                print("[ViewModel] ✅ Loaded processedPlantId=\(processedPlantId) for plant \(plant.id)")
+            } else {
+                print("[ViewModel] ⚠️ WARNING: No processedPlantId in backend response for plant \(plant.id)")
+                print("[ViewModel] Backend should include processedPlantId field!")
+            }
+            
+            // Check status: nil or false = show accept/reject buttons, true = already responded
+            if let status = plant.status, status == true {
+                hasResponded = true
+                responseAccepted = true  // status=true means accepted
+            }
+            
+            recommendationLoaded = true
+            isLoadingRecommendation = false
+            recommendationError = false
+            userOpinion = ""
+            
+            // Also cache it locally for offline use
+            UserDefaults.standard.set(disease, forKey: "plant_\(plant.id)_disease")
+            UserDefaults.standard.set(recommendedAction, forKey: "plant_\(plant.id)_recommendation")
+            
+            print("[ViewModel] Loaded recommendation from backend for plant \(plant.id)")
+            return
+        }
+        
+        // Try to load cached recommendation data (fallback)
         let diseaseKey = "plant_\(plant.id)_disease"
         let recommendationKey = "plant_\(plant.id)_recommendation"
         let processedPlantIdKey = "plant_\(plant.id)_processed_plant_id"
@@ -163,15 +209,24 @@ class PlantDetailViewModel: ObservableObject {
         UserDefaults.standard.set(true, forKey: "plant_\(plantId)_responded")
         UserDefaults.standard.set(accepted, forKey: "plant_\(plantId)_accepted")
         
-        Task {
-            do {
-                try await APIClient.shared.post(
-                    endpoint: "/plants/\(plantId)/recommendation/respond",
-                    body: RespondBody(accepted: accepted),
-                    requiresAuth: true
-                )
-            } catch {
-                print("Failed to save response:", error)
+        // Only send accept immediately; reject will be sent with comment in submitOpinion()
+        if accepted {
+            Task {
+                guard let processedPlantId = self.processedPlantId else {
+                    print("[ViewModel] Cannot accept: processed_plant_id is missing")
+                    return
+                }
+                
+                do {
+                    try await APIClient.shared.post(
+                        endpoint: "/processed-plants/\(processedPlantId)/accept",
+                        body: EmptyBody(),
+                        requiresAuth: true
+                    )
+                    print("[ViewModel] Accepted for processedPlantId=\(processedPlantId)")
+                } catch {
+                    print("Failed to send accept:", error)
+                }
             }
         }
     }
@@ -189,20 +244,14 @@ class PlantDetailViewModel: ObservableObject {
         defer { isSubmittingOpinion = false }
         
         do {
-            let response: UpdateRecommendationResponse = try await APIClient.shared.patch(
-                endpoint: "/processed-plants/recommendation",
-                body: UpdateRecommendationBody(processedPlantId: processedPlantId, text: trimmed),
-                requiresAuth: true,
-                baseURL: AppConfig.microserviceURL
+            // First, send reject with comment
+            try await APIClient.shared.post(
+                endpoint: "/processed-plants/\(processedPlantId)/reject",
+                body: RejectBody(comment: trimmed),
+                requiresAuth: true
             )
             
-            // Update the recommendation with the new text and disease
-            estimatedDisease = response.disease
-            recommendation = response.text
-            
-            // Update cached values
-            UserDefaults.standard.set(response.disease, forKey: "plant_\(plantId)_disease")
-            UserDefaults.standard.set(response.text, forKey: "plant_\(plantId)_recommendation")
+            print("[ViewModel] Rejected with comment for processedPlantId=\(processedPlantId)")
             
             withAnimation { 
                 opinionSubmitted = true 
