@@ -14,7 +14,7 @@ class RoverAPI:
         right_motor_pins=(16, 12),
         ultrasonic1_pins=(23, 24),
         ultrasonic2_pins=(27, 17),
-        ultrasonic3_pins=(13, 6),
+        ultrasonic3_pins=(5, 6),
     ):
         self.gps = GPSProvider(port=gps_port, baud=gps_baud, fallback_file=gps_fallback_file)
         self.ultrasonic = DualUltrasonicArray(

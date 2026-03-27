@@ -10,7 +10,7 @@ class DualUltrasonicArray:
         sensor1_echo=24,
         sensor2_trig=27,
         sensor2_echo=17,
-        sensor3_trig=13,
+        sensor3_trig=5,
         sensor3_echo=6,
         settle_seconds=2.0,
         inter_sensor_delay_seconds=0.005,
