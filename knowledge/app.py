@@ -250,6 +250,47 @@ def upsert_processed_plant(
         conn.commit()
 
 
+def refresh_reference_catalog() -> None:
+    global reference_by_path
+    global reference_by_name
+
+    _, reference_by_path, reference_by_name = load_reference_catalog()
+
+
+def update_processed_plant_recommendation(
+    processed_plant_id: int,
+    text: str,
+) -> tuple[int, int, str, str]:
+    with open_db_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, plant_id, COALESCE(disease, '') FROM public.processed_plants WHERE id = %s",
+            (processed_plant_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="processed_plant not found")
+
+        row_id = int(row[0])
+        plant_id = int(row[1])
+        disease = row[2]
+
+        if disease:
+            cur.execute(
+                "UPDATE public.processed_plants SET recommended_action = %s WHERE disease = %s",
+                (text, disease),
+            )
+        else:
+            cur.execute(
+                "UPDATE public.processed_plants SET recommended_action = %s WHERE id = %s",
+                (text, processed_plant_id),
+            )
+
+        conn.commit()
+
+    refresh_reference_catalog()
+    return row_id, plant_id, disease, text
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global has_health_status_column
@@ -300,6 +341,18 @@ class MobileRecommendationResponse(BaseModel):
     disease: str
     text: str
 
+
+class UpdateProcessedPlantRecommendationRequest(BaseModel):
+    processed_plant_id: int = Field(ge=1)
+    text: str = Field(min_length=1)
+
+
+class UpdateProcessedPlantRecommendationResponse(BaseModel):
+    processed_plant_id: int
+    plant_id: int
+    disease: str
+    text: str
+
 @app.post("/mobile/recommendation", response_model=MobileRecommendationResponse)
 async def mobile_recommendation(payload: MobileRecommendationRequest) -> MobileRecommendationResponse:
     rag = get_index()
@@ -330,6 +383,25 @@ async def mobile_recommendation(payload: MobileRecommendationRequest) -> MobileR
         plant_id=payload.plant_id,
         disease=resolved.disease,
         text=resolved.recommendation,
+    )
+
+
+@app.patch(
+    "/processed-plants/recommendation",
+    response_model=UpdateProcessedPlantRecommendationResponse,
+)
+def update_recommendation(
+    payload: UpdateProcessedPlantRecommendationRequest,
+) -> UpdateProcessedPlantRecommendationResponse:
+    processed_plant_id, plant_id, disease, text = update_processed_plant_recommendation(
+        payload.processed_plant_id,
+        payload.text.strip(),
+    )
+    return UpdateProcessedPlantRecommendationResponse(
+        processed_plant_id=processed_plant_id,
+        plant_id=plant_id,
+        disease=disease,
+        text=text,
     )
 
 @app.get("/health")
