@@ -6,17 +6,25 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+import cv2
+import numpy as np
 import pytorch_lightning as pl
+import torch
 from omegaconf import OmegaConf
 from pytorch_lightning.callbacks import ModelCheckpoint
+from torch.utils.data import DataLoader, Dataset
 
 from plant_pipeline.anomaly.backends.efficientad_backend import (
     _build_repo_efficientad_class,
+    _build_default_transform,
     _load_efficientad_runtime,
+    _predict_raw_efficientad_paths,
+    list_image_paths,
+    load_raw_efficientad_bundle,
     predict_efficientad_paths,
 )
 from plant_pipeline.anomaly.backends.patchcore_backend import predict_patchcore_paths
-from plant_pipeline.anomaly.bundle import active_backend_settings, resolve_bundle_dir, write_model_bundle_metadata
+from plant_pipeline.anomaly.bundle import active_backend_settings, load_model_bundle, resolve_bundle_dir, write_model_bundle_metadata
 from plant_pipeline.anomaly.calibration import calibrate_thresholds, write_threshold_bundle
 from plant_pipeline.anomaly.dataset import (
     ensure_dataset_layout,
@@ -55,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--val-good-dir", default=None)
     calibrate.add_argument("--val-bad-dir", default=None)
 
+    package_raw = subparsers.add_parser("package-raw-efficientad")
+    package_raw.add_argument("--config", default=None)
+    package_raw.add_argument("--source-dir", required=True)
+    package_raw.add_argument("--dataset-version", required=True)
+
     return parser
 
 
@@ -68,6 +81,199 @@ def _installed_anomalib_version() -> str:
     except ImportError:
         return "unavailable"
     return getattr(anomalib, "__version__", "unknown")
+
+
+class _ImagePathDataset(Dataset):
+    def __init__(self, directory: str | Path, *, image_size: int, return_pair: bool = False) -> None:
+        self.paths = list_image_paths(directory)
+        self.transform = _build_default_transform(image_size)
+        self.return_pair = return_pair
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int):
+        path = self.paths[index]
+        image = cv2.imread(str(path))
+        if image is None:
+            raise ValueError(f"Failed to read image: {path}")
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        tensor = self.transform(rgb)
+        if self.return_pair:
+            return tensor, tensor
+        return tensor
+
+
+@torch.no_grad()
+def _teacher_normalization_from_dir(teacher: Any, directory: str | Path, *, image_size: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    dataset = _ImagePathDataset(directory, image_size=image_size, return_pair=False)
+    if len(dataset) == 0:
+        raise ValueError(f"Teacher normalization requires at least one image in {directory}")
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+    teacher = teacher.eval().to(device)
+    mean_outputs = []
+    for train_image in loader:
+        train_image = train_image.to(device)
+        teacher_output = teacher(train_image)
+        mean_outputs.append(torch.mean(teacher_output, dim=[0, 2, 3]))
+    channel_mean = torch.mean(torch.stack(mean_outputs), dim=0)[None, :, None, None]
+
+    mean_distances = []
+    for train_image in loader:
+        train_image = train_image.to(device)
+        teacher_output = teacher(train_image)
+        distance = (teacher_output - channel_mean) ** 2
+        mean_distances.append(torch.mean(distance, dim=[0, 2, 3]))
+    channel_var = torch.mean(torch.stack(mean_distances), dim=0)[None, :, None, None]
+    channel_std = torch.sqrt(channel_var)
+    return channel_mean.cpu(), channel_std.cpu()
+
+
+@torch.no_grad()
+def _map_normalization_from_dir(
+    teacher: Any,
+    student: Any,
+    autoencoder: Any,
+    directory: str | Path,
+    *,
+    image_size: int,
+    device: str,
+    teacher_mean: torch.Tensor,
+    teacher_std: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    dataset = _ImagePathDataset(directory, image_size=image_size, return_pair=True)
+    if len(dataset) == 0:
+        raise ValueError(f"Map normalization requires at least one image in {directory}")
+    loader = DataLoader(dataset, batch_size=1, shuffle=False, num_workers=0)
+    teacher = teacher.eval().to(device)
+    student = student.eval().to(device)
+    autoencoder = autoencoder.eval().to(device)
+    teacher_mean = teacher_mean.to(device)
+    teacher_std = teacher_std.to(device)
+    maps_st = []
+    maps_ae = []
+    for image, _ in loader:
+        image = image.to(device)
+        teacher_output = teacher(image)
+        teacher_output = (teacher_output - teacher_mean) / teacher_std
+        student_output = student(image)
+        autoencoder_output = autoencoder(image)
+        maps_st.append(torch.mean((teacher_output - student_output[:, : teacher_output.shape[1]]) ** 2, dim=1, keepdim=True))
+        maps_ae.append(torch.mean((autoencoder_output - student_output[:, teacher_output.shape[1] :]) ** 2, dim=1, keepdim=True))
+    maps_st_tensor = torch.cat(maps_st)
+    maps_ae_tensor = torch.cat(maps_ae)
+    return (
+        torch.quantile(maps_st_tensor, q=0.9).cpu(),
+        torch.quantile(maps_st_tensor, q=0.995).cpu(),
+        torch.quantile(maps_ae_tensor, q=0.9).cpu(),
+        torch.quantile(maps_ae_tensor, q=0.995).cpu(),
+    )
+
+
+def _package_raw_efficientad_bundle(config: Batch2Config, *, source_dir: Path, dataset_version: str) -> Path:
+    required = {
+        "teacher_final": source_dir / "teacher_final.pth",
+        "student_final": source_dir / "student_final.pth",
+        "autoencoder_final": source_dir / "autoencoder_final.pth",
+    }
+    missing = [name for name, path in required.items() if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"Missing EfficientAD source artifacts: {', '.join(sorted(missing))}")
+
+    train_good_dir = Path(config.efficientad.normal_train_dir)
+    val_good_dir = Path(config.efficientad.val_good_dir)
+    val_bad_dir = Path(config.efficientad.val_bad_dir)
+    if not train_good_dir.exists():
+        raise FileNotFoundError(f"Missing train/good directory: {train_good_dir}")
+    if not val_good_dir.exists():
+        raise FileNotFoundError(f"Missing val/good directory: {val_good_dir}")
+    if not val_bad_dir.exists():
+        raise FileNotFoundError(f"Missing val/bad directory: {val_bad_dir}")
+
+    device = config.efficientad.device
+    teacher = torch.load(required["teacher_final"], map_location=device, weights_only=False)
+    student = torch.load(required["student_final"], map_location=device, weights_only=False)
+    autoencoder = torch.load(required["autoencoder_final"], map_location=device, weights_only=False)
+
+    teacher_mean, teacher_std = _teacher_normalization_from_dir(
+        teacher,
+        train_good_dir,
+        image_size=config.efficientad.image_size,
+        device=device,
+    )
+    q_st_start, q_st_end, q_ae_start, q_ae_end = _map_normalization_from_dir(
+        teacher,
+        student,
+        autoencoder,
+        val_good_dir,
+        image_size=config.efficientad.image_size,
+        device=device,
+        teacher_mean=teacher_mean,
+        teacher_std=teacher_std,
+    )
+
+    bundle_dir = resolve_bundle_dir(config)
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    teacher_bundle_path = bundle_dir / "teacher_final.pth"
+    student_bundle_path = bundle_dir / "student_final.pth"
+    autoencoder_bundle_path = bundle_dir / "autoencoder_final.pth"
+    shutil.copy2(required["teacher_final"], teacher_bundle_path)
+    shutil.copy2(required["student_final"], student_bundle_path)
+    shutil.copy2(required["autoencoder_final"], autoencoder_bundle_path)
+
+    stats_path = bundle_dir / "normalization_stats.pt"
+    torch.save(
+        {
+            "teacher_mean": teacher_mean,
+            "teacher_std": teacher_std,
+            "q_st_start": q_st_start,
+            "q_st_end": q_st_end,
+            "q_ae_start": q_ae_start,
+            "q_ae_end": q_ae_end,
+            "image_size": config.efficientad.image_size,
+        },
+        stats_path,
+    )
+
+    raw_bundle = load_raw_efficientad_bundle(
+        type(
+            "_Bundle",
+            (),
+            {
+                "teacher_path": str(teacher_bundle_path),
+                "student_path": str(student_bundle_path),
+                "autoencoder_path": str(autoencoder_bundle_path),
+                "normalization_stats_path": str(stats_path),
+            },
+        )(),
+        device=device,
+    )
+    good_scores = [float(item["score"]) for item in _predict_raw_efficientad_paths(raw_bundle, val_good_dir)]
+    bad_scores = [float(item["score"]) for item in _predict_raw_efficientad_paths(raw_bundle, val_bad_dir)]
+    thresholds = calibrate_thresholds(good_scores, bad_scores, config.thresholds, dataset_version=dataset_version)
+    thresholds_path = write_threshold_bundle(bundle_dir / "thresholds.json", thresholds)
+    metadata_path = write_model_bundle_metadata(
+        bundle_dir,
+        model_name=config.efficientad.model_name,
+        model_version=config.efficientad.model_version,
+        image_size=config.efficientad.image_size,
+        dataset_version=dataset_version,
+        anomalib_version="repo-raw-efficientad",
+        checkpoint_path=None,
+        thresholds_path=thresholds_path,
+        calibration_mode="bad-aware" if bad_scores else "normal-only",
+        score_summary=thresholds.score_summary,
+        extra_metadata={
+            "artifact_format": "efficientad_raw_triplet",
+            "teacher_path": teacher_bundle_path.name,
+            "student_path": student_bundle_path.name,
+            "autoencoder_path": autoencoder_bundle_path.name,
+            "normalization_stats_path": stats_path.name,
+            "model_size": config.efficientad.model_size,
+            "teacher_out_channels": config.efficientad.teacher_out_channels,
+        },
+    )
+    return metadata_path
 
 
 def _build_patchcore_anomalib_config(config: Batch2Config, project_path: Path) -> Any:
@@ -248,17 +454,21 @@ def _fit_bundle(config: Batch2Config) -> Path:
 def _collect_scores(config: Batch2Config, directory: Path) -> list[float]:
     if not directory.exists():
         return []
-    bundle_dir = resolve_bundle_dir(config)
-    checkpoint_path = bundle_dir / "model.ckpt"
     backend = config.batch2.backend.lower()
     if backend == "efficientad":
-        items = predict_efficientad_paths(
-            checkpoint_path,
-            directory,
-            config=config,
-            batch_size=config.efficientad.eval_batch_size,
-            num_workers=config.efficientad.num_workers,
-        )
+        bundle = load_model_bundle(config)
+        if bundle.artifact_format == "efficientad_raw_triplet":
+            raw_bundle = load_raw_efficientad_bundle(bundle, device=config.efficientad.device)
+            items = _predict_raw_efficientad_paths(raw_bundle, directory)
+        else:
+            checkpoint_path = resolve_bundle_dir(config) / "model.ckpt"
+            items = predict_efficientad_paths(
+                checkpoint_path,
+                directory,
+                config=config,
+                batch_size=config.efficientad.eval_batch_size,
+                num_workers=config.efficientad.num_workers,
+            )
     elif backend == "patchcore":
         items = predict_patchcore_paths(
             checkpoint_path,
@@ -361,6 +571,29 @@ def main() -> None:
                     "bundle_dir": str(resolve_bundle_dir(config)),
                     "checkpoint_path": str(checkpoint_path),
                     "train_good_dir": settings.normal_train_dir,
+                },
+                indent=2,
+            )
+        )
+        return
+
+    if args.command == "package-raw-efficientad":
+        if config.batch2.backend.lower() != "efficientad":
+            raise RuntimeError("package-raw-efficientad is only supported for the EfficientAD backend.")
+        metadata_path = _package_raw_efficientad_bundle(
+            config,
+            source_dir=Path(args.source_dir),
+            dataset_version=args.dataset_version,
+        )
+        bundle_dir = resolve_bundle_dir(config)
+        print(
+            json.dumps(
+                {
+                    "backend": config.batch2.backend,
+                    "bundle_dir": str(bundle_dir),
+                    "metadata_path": str(metadata_path),
+                    "thresholds_path": str(bundle_dir / "thresholds.json"),
+                    "normalization_stats_path": str(bundle_dir / "normalization_stats.pt"),
                 },
                 indent=2,
             )

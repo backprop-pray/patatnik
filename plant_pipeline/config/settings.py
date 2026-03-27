@@ -63,14 +63,14 @@ class Batch1DetectorSettings(BaseModel):
 
 class Batch1ClusterSettings(BaseModel):
     merge_iou_threshold: float = 0.15
-    merge_distance_threshold: float = 0.08
+    merge_distance_threshold: float = 0.03
     min_cluster_members: int = 1
     min_cluster_area_ratio: float = 0.01
-    bbox_expand_ratio: float = 0.12
-    single_detection_expand_ratio: float = 0.45
-    single_detection_context_distance_ratio: float = 0.20
-    min_final_roi_width_ratio: float = 0.20
-    min_final_roi_height_ratio: float = 0.25
+    bbox_expand_ratio: float = 0.06
+    single_detection_expand_ratio: float = 0.18
+    single_detection_context_distance_ratio: float = 0.12
+    min_final_roi_width_ratio: float = 0.14
+    min_final_roi_height_ratio: float = 0.18
     oversized_cluster_penalty_start: float = 0.35
     oversized_cluster_penalty_weight: float = 0.80
     border_touch_margin_ratio: float = 0.03
@@ -158,6 +158,31 @@ class Batch2EfficientAdSettings(BaseModel):
     max_epochs: int = 200
     max_steps: int = 70000
     seed: int = 42
+    use_deterministic_demo_scorer: bool = True
+    deterministic_enabled: bool = True
+    leaf_min_area_ratio: float = 0.08
+    min_leaf_coverage_for_confident_scoring: float = 0.18
+    uncertain_on_weak_leaf_mask: bool = True
+    green_h_min: int = 25
+    green_h_max: int = 105
+    green_s_min: int = 35
+    green_v_min: int = 35
+    yellow_h_min: int = 8
+    yellow_h_max: int = 42
+    yellow_s_min: int = 45
+    yellow_v_min: int = 45
+    brown_h_min: int = 0
+    brown_h_max: int = 28
+    brown_s_min: int = 50
+    brown_v_max: int = 190
+    rust_h_min: int = 0
+    rust_h_max: int = 18
+    rust_s_min: int = 70
+    rust_v_min: int = 45
+    necrosis_s_min: int = 25
+    necrosis_v_max: int = 95
+    normal_max_lesion_ratio: float = 0.08
+    suspicious_min_lesion_ratio: float = 0.20
 
 
 class Batch2ThresholdSettings(BaseModel):

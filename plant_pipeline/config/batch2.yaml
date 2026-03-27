@@ -38,6 +38,31 @@ efficientad:
   max_epochs: 200
   max_steps: 70000
   seed: 42
+  use_deterministic_demo_scorer: true
+  deterministic_enabled: true
+  leaf_min_area_ratio: 0.08
+  min_leaf_coverage_for_confident_scoring: 0.18
+  uncertain_on_weak_leaf_mask: true
+  green_h_min: 25
+  green_h_max: 105
+  green_s_min: 35
+  green_v_min: 35
+  yellow_h_min: 8
+  yellow_h_max: 42
+  yellow_s_min: 45
+  yellow_v_min: 45
+  brown_h_min: 0
+  brown_h_max: 28
+  brown_s_min: 50
+  brown_v_max: 190
+  rust_h_min: 0
+  rust_h_max: 18
+  rust_s_min: 70
+  rust_v_min: 45
+  necrosis_s_min: 25
+  necrosis_v_max: 95
+  normal_max_lesion_ratio: 0.08
+  suspicious_min_lesion_ratio: 0.2
 patchcore:
   backend: patchcore
   dataset_root: ./data/datasets/roi_anomaly
@@ -66,8 +91,8 @@ patchcore:
   model_version: patchcore-wideresnet50-v1-runpod
   allow_inference_fallback: false
 thresholds:
-  lower_threshold:
-  upper_threshold:
+  lower_threshold: 0.2
+  upper_threshold: 0.45
   normal_percentile: 0.95
   suspicious_percentile: 0.995
   min_gap: 0.05

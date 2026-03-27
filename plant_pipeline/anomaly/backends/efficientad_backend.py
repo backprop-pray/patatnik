@@ -6,6 +6,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import torch
 from torch.utils.data import DataLoader
 
 from plant_pipeline.anomaly.base import AnomalyBackend
@@ -188,6 +189,107 @@ def predict_efficientad_paths(
     return items
 
 
+def list_image_paths(input_path: str | Path) -> list[Path]:
+    root = Path(input_path)
+    if root.is_file():
+        return [root]
+    if not root.exists():
+        raise FileNotFoundError(f"Input path not found: {input_path}")
+    patterns = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp", "*.tif", "*.tiff")
+    paths: list[Path] = []
+    for pattern in patterns:
+        paths.extend(root.rglob(pattern))
+    return sorted(path for path in paths if path.is_file())
+
+
+def _build_default_transform(image_size: int):
+    from torchvision import transforms
+
+    return transforms.Compose(
+        [
+            transforms.ToPILImage(),
+            transforms.Resize((image_size, image_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ]
+    )
+
+
+def load_raw_efficientad_bundle(bundle, *, device: str) -> dict[str, Any]:
+    required_paths = {
+        "teacher_path": bundle.teacher_path,
+        "student_path": bundle.student_path,
+        "autoencoder_path": bundle.autoencoder_path,
+        "normalization_stats_path": bundle.normalization_stats_path,
+    }
+    missing_fields = [name for name, value in required_paths.items() if not value]
+    if missing_fields:
+        raise FileNotFoundError(f"EfficientAD raw bundle is missing metadata fields: {', '.join(sorted(missing_fields))}")
+    missing_files = [name for name, value in required_paths.items() if not Path(value).exists()]
+    if missing_files:
+        raise FileNotFoundError(f"EfficientAD raw bundle files not found: {', '.join(sorted(missing_files))}")
+
+    map_location = torch.device(device)
+    teacher = torch.load(bundle.teacher_path, map_location=map_location, weights_only=False)
+    student = torch.load(bundle.student_path, map_location=map_location, weights_only=False)
+    autoencoder = torch.load(bundle.autoencoder_path, map_location=map_location, weights_only=False)
+    stats = torch.load(bundle.normalization_stats_path, map_location=map_location, weights_only=False)
+
+    for model in (teacher, student, autoencoder):
+        model.eval()
+        model.to(map_location)
+
+    return {
+        "teacher": teacher,
+        "student": student,
+        "autoencoder": autoencoder,
+        "teacher_mean": stats["teacher_mean"].to(map_location),
+        "teacher_std": stats["teacher_std"].to(map_location),
+        "q_st_start": stats["q_st_start"].to(map_location),
+        "q_st_end": stats["q_st_end"].to(map_location),
+        "q_ae_start": stats["q_ae_start"].to(map_location),
+        "q_ae_end": stats["q_ae_end"].to(map_location),
+        "image_size": int(stats.get("image_size", 256)),
+        "device": map_location,
+    }
+
+
+@torch.no_grad()
+def _predict_raw_efficientad_paths(raw_bundle: dict[str, Any], input_path: str | Path) -> list[dict[str, Any]]:
+    transform = _build_default_transform(raw_bundle["image_size"])
+    items: list[dict[str, Any]] = []
+    for image_path in list_image_paths(input_path):
+        image = cv2.imread(str(image_path))
+        if image is None:
+            raise ValueError(f"Failed to read ROI image: {image_path}")
+        rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        orig_height, orig_width = rgb.shape[:2]
+        tensor = transform(rgb).unsqueeze(0).to(raw_bundle["device"])
+
+        teacher_output = raw_bundle["teacher"](tensor)
+        teacher_output = (teacher_output - raw_bundle["teacher_mean"]) / raw_bundle["teacher_std"]
+        student_output = raw_bundle["student"](tensor)
+        autoencoder_output = raw_bundle["autoencoder"](tensor)
+
+        map_st = torch.mean((teacher_output - student_output[:, : teacher_output.shape[1]]) ** 2, dim=1, keepdim=True)
+        map_ae = torch.mean((autoencoder_output - student_output[:, teacher_output.shape[1] :]) ** 2, dim=1, keepdim=True)
+        map_st = 0.1 * (map_st - raw_bundle["q_st_start"]) / (raw_bundle["q_st_end"] - raw_bundle["q_st_start"])
+        map_ae = 0.1 * (map_ae - raw_bundle["q_ae_start"]) / (raw_bundle["q_ae_end"] - raw_bundle["q_ae_start"])
+        map_combined = 0.5 * map_st + 0.5 * map_ae
+        map_combined = torch.nn.functional.pad(map_combined, (4, 4, 4, 4))
+        map_combined = torch.nn.functional.interpolate(map_combined, (orig_height, orig_width), mode="bilinear")
+        anomaly_map = map_combined[0, 0].detach().cpu().numpy().astype(np.float32)
+        items.append(
+            {
+                "image_path": str(image_path),
+                "score": float(np.max(anomaly_map)),
+                "anomaly_map": anomaly_map,
+                "checkpoint_hparams": {},
+            }
+        )
+    return items
+
+
 class EfficientAdBackend(AnomalyBackend):
     name = "efficientad"
 
@@ -196,14 +298,18 @@ class EfficientAdBackend(AnomalyBackend):
         self.bundle = None
         self.model_name = config.efficientad.model_name
         self.model_version = config.efficientad.model_version
+        self._raw_bundle: dict[str, Any] | None = None
         self._loaded = False
 
     def load(self) -> None:
         self.bundle = load_model_bundle(self.config)
-        checkpoint = Path(self.bundle.checkpoint_path)
-        if not checkpoint.exists():
-            raise FileNotFoundError(f"EfficientAD checkpoint not found: {checkpoint}")
-        _load_efficientad_runtime()
+        if self.bundle.artifact_format == "efficientad_raw_triplet":
+            self._raw_bundle = load_raw_efficientad_bundle(self.bundle, device=self.config.efficientad.device)
+        else:
+            checkpoint = Path(self.bundle.checkpoint_path or "")
+            if not checkpoint.exists():
+                raise FileNotFoundError(f"EfficientAD checkpoint not found: {checkpoint}")
+            _load_efficientad_runtime()
         self.model_name = self.bundle.model_name
         self.model_version = self.bundle.model_version
         self._loaded = True
@@ -214,20 +320,34 @@ class EfficientAdBackend(AnomalyBackend):
         roi_path = Path(request.roi_path)
         if not roi_path.exists():
             raise FileNotFoundError(f"ROI not found: {request.roi_path}")
+        if self.bundle is None:
+            raise RuntimeError("EfficientAD bundle is not loaded.")
         image = cv2.imread(str(roi_path))
         if image is None:
             raise ValueError(f"Failed to read ROI image: {request.roi_path}")
-        items = predict_efficientad_paths(
-            self.bundle.checkpoint_path,
-            request.roi_path,
-            config=self.config,
-            batch_size=1,
-            num_workers=self.config.efficientad.num_workers,
-        )
-        if not items:
-            raise RuntimeError(f"EfficientAD returned no predictions for {request.roi_path}")
-        score = float(items[0]["score"])
-        anomaly_map = items[0]["anomaly_map"]
+        if self.config.efficientad.use_deterministic_demo_scorer and self.config.efficientad.deterministic_enabled:
+            score, anomaly_map, backend_mode, debug_metrics = self._predict_deterministic(image)
+        elif self.bundle.artifact_format == "efficientad_raw_triplet":
+            if self._raw_bundle is None:
+                raise RuntimeError("EfficientAD raw bundle is not loaded.")
+            items = _predict_raw_efficientad_paths(self._raw_bundle, request.roi_path)
+            backend_mode = "repo_efficientad_raw"
+            debug_metrics = {}
+        else:
+            items = predict_efficientad_paths(
+                self.bundle.checkpoint_path,
+                request.roi_path,
+                config=self.config,
+                batch_size=1,
+                num_workers=self.config.efficientad.num_workers,
+            )
+            backend_mode = "anomalib_efficientad"
+            debug_metrics = {}
+        if not (self.config.efficientad.use_deterministic_demo_scorer and self.config.efficientad.deterministic_enabled):
+            if not items:
+                raise RuntimeError(f"EfficientAD returned no predictions for {request.roi_path}")
+            score = float(items[0]["score"])
+            anomaly_map = items[0]["anomaly_map"]
         lower, upper = self._thresholds()
         label = self._label_for_score(score, lower, upper)
         confidence = self._confidence_for_score(score, lower, upper)
@@ -247,8 +367,9 @@ class EfficientAdBackend(AnomalyBackend):
             model_name=self.model_name,
             model_version=self.model_version,
             debug={
-                "backend_mode": "anomalib_efficientad",
+                "backend_mode": backend_mode,
                 "bundle_dir": self.bundle.bundle_dir if self.bundle is not None else "",
+                **debug_metrics,
                 "metadata": request.metadata,
             },
         )
@@ -277,7 +398,105 @@ class EfficientAdBackend(AnomalyBackend):
         )
 
     def close(self) -> None:
+        self._raw_bundle = None
         self._loaded = False
+
+    def _predict_deterministic(self, image_bgr: np.ndarray) -> tuple[float, np.ndarray | None, str, dict[str, Any]]:
+        settings = self.config.efficientad
+        image = cv2.resize(image_bgr, (settings.image_size, settings.image_size))
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+
+        green_mask = cv2.inRange(
+            hsv,
+            np.array([settings.green_h_min, settings.green_s_min, settings.green_v_min], dtype=np.uint8),
+            np.array([settings.green_h_max, 255, 255], dtype=np.uint8),
+        )
+        yellow_mask = cv2.inRange(
+            hsv,
+            np.array([settings.yellow_h_min, settings.yellow_s_min, settings.yellow_v_min], dtype=np.uint8),
+            np.array([settings.yellow_h_max, 255, 255], dtype=np.uint8),
+        )
+        brown_mask = cv2.inRange(
+            hsv,
+            np.array([settings.brown_h_min, settings.brown_s_min, 0], dtype=np.uint8),
+            np.array([settings.brown_h_max, 255, settings.brown_v_max], dtype=np.uint8),
+        )
+        rust_mask = cv2.inRange(
+            hsv,
+            np.array([settings.rust_h_min, settings.rust_s_min, settings.rust_v_min], dtype=np.uint8),
+            np.array([settings.rust_h_max, 255, 255], dtype=np.uint8),
+        )
+        necrosis_mask = cv2.inRange(
+            hsv,
+            np.array([0, settings.necrosis_s_min, 0], dtype=np.uint8),
+            np.array([179, 255, settings.necrosis_v_max], dtype=np.uint8),
+        )
+        sat_mask = cv2.threshold(hsv[:, :, 1], 20, 255, cv2.THRESH_BINARY)[1]
+        color_seed = cv2.bitwise_or(cv2.bitwise_or(green_mask, yellow_mask), cv2.bitwise_or(brown_mask, rust_mask))
+        color_seed = cv2.bitwise_or(color_seed, cv2.bitwise_and(necrosis_mask, sat_mask))
+        kernel = np.ones((5, 5), np.uint8)
+        leaf_mask = cv2.morphologyEx(color_seed, cv2.MORPH_CLOSE, kernel, iterations=2)
+        leaf_mask = cv2.morphologyEx(leaf_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        contours, _ = cv2.findContours(leaf_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            contour_area = float(cv2.contourArea(largest))
+            if contour_area > 0:
+                filled = np.zeros_like(leaf_mask)
+                cv2.drawContours(filled, [largest], -1, 255, thickness=cv2.FILLED)
+                leaf_mask = filled
+
+        leaf_area_ratio = float(np.count_nonzero(leaf_mask)) / float(leaf_mask.size)
+        if leaf_area_ratio > 0:
+            lesion_seed = cv2.bitwise_or(cv2.bitwise_or(yellow_mask, brown_mask), cv2.bitwise_or(rust_mask, necrosis_mask))
+            lesion_mask = cv2.bitwise_and(lesion_seed, lesion_seed, mask=leaf_mask)
+            lesion_mask = cv2.morphologyEx(lesion_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+            lesion_mask = cv2.morphologyEx(lesion_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+        else:
+            lesion_mask = np.zeros_like(leaf_mask)
+
+        lesion_ratio = float(np.count_nonzero(lesion_mask)) / float(max(np.count_nonzero(leaf_mask), 1))
+        green_ratio = float(np.count_nonzero(cv2.bitwise_and(green_mask, green_mask, mask=leaf_mask))) / float(max(np.count_nonzero(leaf_mask), 1))
+        edge_density = float(np.count_nonzero(cv2.Canny(gray, 60, 140) & lesion_mask)) / float(max(np.count_nonzero(leaf_mask), 1))
+        a_channel = lab[:, :, 1].astype(np.float32)
+        b_channel = lab[:, :, 2].astype(np.float32)
+        warm_bias = float(np.mean(((b_channel - a_channel) > 8)[leaf_mask > 0])) if np.count_nonzero(leaf_mask) else 0.0
+
+        lesion_score = (
+            lesion_ratio * 2.6
+            + edge_density * 3.5
+            + max(0.0, warm_bias - 0.15) * 0.5
+            + max(0.0, 0.65 - green_ratio) * 0.6
+        )
+        lesion_score = float(np.clip(lesion_score, 0.0, 1.0))
+
+        weak_leaf_mask = leaf_area_ratio < settings.min_leaf_coverage_for_confident_scoring
+        if leaf_area_ratio < settings.leaf_min_area_ratio:
+            lesion_score = max(lesion_score, 0.30)
+        elif weak_leaf_mask and settings.uncertain_on_weak_leaf_mask:
+            lesion_score = float(np.clip(max(lesion_score, 0.30), 0.20, 0.44))
+        else:
+            if lesion_ratio <= settings.normal_max_lesion_ratio and green_ratio >= 0.50:
+                lesion_score = min(lesion_score, 0.18)
+            if lesion_ratio >= settings.suspicious_min_lesion_ratio:
+                lesion_score = max(lesion_score, 0.55)
+
+        lesion_heatmap = (
+            lesion_mask.astype(np.float32) / 255.0 * 0.75
+            + (cv2.GaussianBlur((lesion_mask > 0).astype(np.float32), (0, 0), 2.2) * 0.25)
+        )
+        lesion_heatmap = np.clip(lesion_heatmap, 0.0, 1.0).astype(np.float32)
+        return lesion_score, lesion_heatmap, "deterministic_lesion_scorer", {
+            "leaf_area_ratio": leaf_area_ratio,
+            "lesion_ratio": lesion_ratio,
+            "green_ratio": green_ratio,
+            "edge_density": edge_density,
+            "warm_bias": warm_bias,
+            "weak_leaf_mask": weak_leaf_mask,
+        }
 
     def _thresholds(self) -> tuple[float, float]:
         if self.bundle is None:

@@ -55,9 +55,14 @@ class Batch2ModelBundle(BaseModel):
     bundle_dir: str
     model_name: str
     model_version: str
-    checkpoint_path: str
+    checkpoint_path: Optional[str] = None
     metadata_path: str
     thresholds: ThresholdBundle
+    artifact_format: str = "anomalib_ckpt"
+    teacher_path: Optional[str] = None
+    student_path: Optional[str] = None
+    autoencoder_path: Optional[str] = None
+    normalization_stats_path: Optional[str] = None
 
 
 class Batch2ErrorResult(BaseModel):

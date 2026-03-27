@@ -27,14 +27,14 @@ detector_batch1:
   licensing_note: "Ultralytics-based backend with vendored pretrained weights from foduucom/plant-leaf-detection-and-classification."
 cluster:
   merge_iou_threshold: 0.15
-  merge_distance_threshold: 0.02
+  merge_distance_threshold: 0.01
   min_cluster_members: 1
   min_cluster_area_ratio: 0.01
-  bbox_expand_ratio: 0.12
-  single_detection_expand_ratio: 0.50
-  single_detection_context_distance_ratio: 0.22
-  min_final_roi_width_ratio: 0.22
-  min_final_roi_height_ratio: 0.28
+  bbox_expand_ratio: 0.05
+  single_detection_expand_ratio: 0.15
+  single_detection_context_distance_ratio: 0.10
+  min_final_roi_width_ratio: 0.14
+  min_final_roi_height_ratio: 0.18
   oversized_cluster_penalty_start: 0.32
   oversized_cluster_penalty_weight: 0.85
   border_touch_margin_ratio: 0.03

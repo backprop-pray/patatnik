@@ -39,24 +39,41 @@ def load_model_bundle(config: Batch2Config) -> Batch2ModelBundle:
     if not metadata_path.exists():
         raise FileNotFoundError(f"Bundle metadata not found: {metadata_path}")
     payload = json.loads(metadata_path.read_text())
-    checkpoint_path = (
-        Path(settings.checkpoint_path)
-        if settings.checkpoint_path
-        else Path(payload.get("checkpoint_path", bundle_dir / "model.ckpt"))
+    artifact_format = payload.get("artifact_format", "anomalib_ckpt")
+
+    def _resolve_optional_path(raw_value: str | None, default_path: Path | None = None) -> Path | None:
+        candidate = raw_value if raw_value not in {"", None} else default_path
+        if candidate is None:
+            return None
+        path = Path(candidate)
+        if not path.is_absolute() and not path.exists():
+            path = metadata_path.parent / path
+        return path
+
+    checkpoint_path = _resolve_optional_path(
+        settings.checkpoint_path if settings.checkpoint_path else payload.get("checkpoint_path"),
+        bundle_dir / "model.ckpt" if artifact_format == "anomalib_ckpt" else None,
     )
-    thresholds_path = Path(payload.get("thresholds_path", bundle_dir / "thresholds.json"))
-    if not thresholds_path.is_absolute() and not thresholds_path.exists():
-        thresholds_path = metadata_path.parent / thresholds_path
-    if not checkpoint_path.is_absolute() and not checkpoint_path.exists():
-        checkpoint_path = metadata_path.parent / checkpoint_path
+    thresholds_path = _resolve_optional_path(payload.get("thresholds_path"), bundle_dir / "thresholds.json")
+    if thresholds_path is None:
+        raise FileNotFoundError(f"Threshold metadata not found: {bundle_dir / 'thresholds.json'}")
     thresholds = load_threshold_bundle(thresholds_path)
     bundle = Batch2ModelBundle(
         bundle_dir=str(bundle_dir),
         model_name=payload.get("model_name", settings.model_name),
         model_version=payload.get("model_version", settings.model_version),
-        checkpoint_path=str(checkpoint_path),
+        checkpoint_path=str(checkpoint_path) if checkpoint_path is not None else None,
         metadata_path=str(metadata_path),
         thresholds=thresholds,
+        artifact_format=artifact_format,
+        teacher_path=str(_resolve_optional_path(payload.get("teacher_path"))) if payload.get("teacher_path") else None,
+        student_path=str(_resolve_optional_path(payload.get("student_path"))) if payload.get("student_path") else None,
+        autoencoder_path=str(_resolve_optional_path(payload.get("autoencoder_path"))) if payload.get("autoencoder_path") else None,
+        normalization_stats_path=(
+            str(_resolve_optional_path(payload.get("normalization_stats_path")))
+            if payload.get("normalization_stats_path")
+            else None
+        ),
     )
     return bundle
 
@@ -69,7 +86,7 @@ def write_model_bundle_metadata(
     image_size: int,
     dataset_version: str,
     anomalib_version: str,
-    checkpoint_path: Path,
+    checkpoint_path: Path | None,
     thresholds_path: Path,
     calibration_mode: str | None = None,
     score_summary: dict[str, float] | None = None,
@@ -85,8 +102,9 @@ def write_model_bundle_metadata(
         "dataset_version": dataset_version,
         "anomalib_version": anomalib_version,
         "thresholds_path": str(thresholds_path),
-        "checkpoint_path": str(checkpoint_path),
     }
+    if checkpoint_path is not None:
+        payload["checkpoint_path"] = str(checkpoint_path)
     if calibration_mode is not None:
         payload["calibration_mode"] = calibration_mode
     if score_summary is not None:
