@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 
@@ -5,9 +6,11 @@ import numpy as np
 
 from picamera2 import Picamera2
 
+log = logging.getLogger(__name__)
+
 
 class PiCam2FrameDriver:
-    def __init__(self, size=(640, 480), pixel_format='RGB888', warmup_seconds=0.2, vflip=False):
+    def __init__(self, size=(640, 480), pixel_format='RGB888', warmup_seconds=1.5, vflip=False):
         self.size = size
         self.pixel_format = pixel_format
         self.warmup_seconds = warmup_seconds
@@ -22,8 +25,9 @@ class PiCam2FrameDriver:
             return
 
         cameras = Picamera2.global_camera_info()
+        log.info('Available cameras: %s', cameras)
         if not cameras:
-            raise RuntimeError('No Pi camera detected. Check cable connection and camera interface settings.')
+            raise RuntimeError('No camera detected. Check cable/connection.')
 
         self._camera = Picamera2()
 
@@ -33,23 +37,36 @@ class PiCam2FrameDriver:
                 return
 
             self._ensure_camera()
-            config = self._camera.create_video_configuration(
-                main={'size': self.size, 'format': self.pixel_format}
-            )
-            self._camera.configure(config)
+
+            # Try video config first (works for USB), fall back to preview (Pi CSI)
+            try:
+                config = self._camera.create_video_configuration(
+                    main={'size': self.size, 'format': self.pixel_format}
+                )
+                self._camera.configure(config)
+                log.info('Camera configured with video configuration')
+            except Exception as e:
+                log.warning('Video config failed (%s), trying preview config', e)
+                config = self._camera.create_preview_configuration(
+                    main={'size': self.size, 'format': self.pixel_format}
+                )
+                self._camera.configure(config)
+                log.info('Camera configured with preview configuration')
+
             self._camera.start()
 
             if self.warmup_seconds > 0:
                 time.sleep(self.warmup_seconds)
 
             self._running = True
+            log.info('Camera started at %s %s', self.size, self.pixel_format)
 
     def get_frame(self):
         if not self._running:
             self.open()
 
         with self._lock:
-            frame = self._camera.capture_array()
+            frame = self._camera.capture_array('main')
             if self.vflip:
                 frame = np.flipud(frame)
             return frame
@@ -61,6 +78,12 @@ class PiCam2FrameDriver:
         with self._lock:
             if not self._running or self._camera is None:
                 return
-
-            self._camera.stop()
+            try:
+                self._camera.stop()
+            except Exception:
+                pass
+            try:
+                self._camera.close()
+            except Exception:
+                pass
             self._running = False

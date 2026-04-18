@@ -1,0 +1,375 @@
+#!/home/yasen/.venv/bin/python3
+import argparse
+import base64
+import json
+import logging
+import mimetypes
+import os
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+from urllib import error, request
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+import ppo_rover
+
+OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions'
+DEFAULT_MODEL = "google/gemini-3.1-flash-lite-preview"
+
+SYSTEM_PROMPT = (
+    "You are a specific sunflower image clasifier, your only job is to say \"DISEASE\" or \"NO DISEASE\" "
+    "as easy json output if you see small (around 30cm) sunflower. "
+    "Tthe pod has white tape on it and is like 5cm big. "
+    "I want anything that looks even a little as a sunflower with some yellow on top to be classified as such!"
+)
+
+USER_PROMPT = (
+    "Classify this image using the exact sunflower rule from the system prompt. "
+    "Return only JSON with one key, for example: {\"answer\":\"DISEASE\"} or {\"answer\":\"NO DISEASE\"}."
+)
+
+_HOOK_INSTALLED = False
+_ORIGINAL_NAV_STEP = None
+_PLANT_STATE_LOCK = threading.Lock()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description='In-process orchestrator using shared state with ppo_rover.')
+    parser.add_argument('--env-file', default='/home/yasen/patatnik/embedded/.env')
+    parser.add_argument('--openrouter-model', default=DEFAULT_MODEL)
+    parser.add_argument('--openrouter-timeout', type=float, default=45.0)
+    parser.add_argument('--send-request-script', default='/home/yasen/patatnik/embedded/send_request.py')
+    parser.add_argument('--plant-api-url', default='http://morzio.com/api/plants')
+    parser.add_argument('--latitude', type=float, default=42.697)
+    parser.add_argument('--longitude', type=float, default=23.321)
+    parser.add_argument('--capture-dir', default='/home/yasen/patatnik/embedded')
+    parser.add_argument('--poll-interval', type=float, default=0.3)
+    parser.add_argument('--cooldown-seconds', type=float, default=10.0)
+    parser.add_argument('--disable-ppo', action='store_true', help='Do not start ppo_rover main loop')
+    parser.add_argument('--once', action='store_true', help='Handle one trigger then stop')
+    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'])
+    return parser.parse_args()
+
+
+def load_env_file(env_path):
+    path = Path(env_path).expanduser()
+    if not path.exists() or not path.is_file():
+        return
+
+    for line in path.read_text(encoding='utf-8', errors='ignore').splitlines():
+        s = line.strip()
+        if not s or s.startswith('#') or '=' not in s:
+            continue
+        key, value = s.split('=', 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def install_plant_found_hook():
+    global _HOOK_INSTALLED, _ORIGINAL_NAV_STEP
+    if _HOOK_INSTALLED:
+        return
+
+    if not hasattr(ppo_rover, 'plant_found'):
+        ppo_rover.plant_found = False
+    if not hasattr(ppo_rover, 'last_plant_image_path'):
+        ppo_rover.last_plant_image_path = None
+
+    threshold = float(getattr(ppo_rover, 'GN_DETECT_THR', 0.12))
+    _ORIGINAL_NAV_STEP = ppo_rover.GreenNavigator.step
+
+    def wrapped_step(self, vf, announce=None):
+        left_total = float(getattr(vf, 'plant_L', 0.0)) + float(getattr(vf, 'tree_L', 0.0))
+        center_total = float(getattr(vf, 'plant_C', 0.0)) + float(getattr(vf, 'tree_C', 0.0))
+        right_total = float(getattr(vf, 'plant_R', 0.0)) + float(getattr(vf, 'tree_R', 0.0))
+        total = left_total + center_total + right_total
+
+        if total >= threshold:
+            with _PLANT_STATE_LOCK:
+                if not ppo_rover.plant_found:
+                    logging.info('Plant detected at %s (score=%.3f)', time.strftime('%Y-%m-%d %H:%M:%S'), total)
+                ppo_rover.plant_found = True
+
+        return _ORIGINAL_NAV_STEP(self, vf, announce=announce)
+
+    ppo_rover.GreenNavigator.step = wrapped_step
+    _HOOK_INSTALLED = True
+
+
+def consume_plant_found_flag():
+    with _PLANT_STATE_LOCK:
+        current = bool(getattr(ppo_rover, 'plant_found', False))
+        if current:
+            ppo_rover.plant_found = False
+        return current
+
+
+def save_latest_stream_frame(capture_dir):
+    stream_state = getattr(ppo_rover, '_stream_state', None)
+    if not isinstance(stream_state, dict):
+        return None
+
+    lock = stream_state.get('lock')
+    if lock is None:
+        return None
+
+    with lock:
+        jpeg = stream_state.get('frame_jpeg')
+
+    if not jpeg:
+        return None
+
+    out_dir = Path(capture_dir).expanduser()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f'plant_{int(time.time() * 1000)}.jpg'
+    out_path.write_bytes(jpeg)
+
+    with _PLANT_STATE_LOCK:
+        ppo_rover.last_plant_image_path = str(out_path)
+
+    return out_path
+
+
+def call_openrouter(image_path, model, timeout_seconds):
+    api_key = os.getenv('OPENROUTER_API_KEY')
+    if not api_key:
+        return {'ok': False, 'reason': 'OPENROUTER_API_KEY missing'}
+
+    mime = mimetypes.guess_type(str(image_path))[0] or 'image/jpeg'
+    b64 = base64.b64encode(Path(image_path).read_bytes()).decode('ascii')
+
+    payload = {
+        'model': model,
+        'messages': [
+            {
+                'role': 'system',
+                'content': SYSTEM_PROMPT,
+            },
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'text', 'text': USER_PROMPT},
+                    {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}},
+                ],
+            },
+        ],
+    }
+
+    req = request.Request(
+        OPENROUTER_URL,
+        data=json.dumps(payload).encode('utf-8'),
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'http://localhost',
+            'X-Title': 'Patatnik InProcess Orchestrator',
+        },
+        method='POST',
+    )
+
+    try:
+        with request.urlopen(req, timeout=timeout_seconds) as resp:
+            raw = resp.read().decode('utf-8', errors='replace')
+            data = json.loads(raw)
+    except error.HTTPError as exc:
+        return {'ok': False, 'reason': f'http_{exc.code}', 'details': exc.read().decode('utf-8', errors='replace')}
+    except Exception as exc:
+        return {'ok': False, 'reason': str(exc)}
+
+    text = None
+    try:
+        text = data['choices'][0]['message']['content']
+    except Exception:
+        pass
+
+    return {'ok': True, 'text': text, 'raw': data}
+
+
+def ai_response_indicates_disease(ai_text):
+    if not ai_text:
+        return False
+
+    s = ' '.join(str(ai_text).strip().lower().split())
+
+    if s in {'no disease', 'healthy', 'normal'}:
+        return False
+    if s in {'disease', 'diseased', 'yes disease'}:
+        return True
+
+    if 'no disease' in s and not any(k in s for k in [
+        'diseased', 'infection', 'infected', 'blight', 'rot', 'fung', 'mildew', 'rust', 'sick', 'anomaly', 'abnormal', 'stress'
+    ]):
+        return False
+
+    positive_markers = [
+        'disease', 'diseased', 'sick', 'infection', 'infected', 'blight', 'rot',
+        'fungus', 'fungal', 'mildew', 'rust', 'anomaly', 'abnormal', 'stress',
+        'unhealthy', 'pathogen', 'necrosis'
+    ]
+    return any(marker in s for marker in positive_markers)
+
+
+def _get_gps_coords(args):
+    """Try to read live GPS from rover; fall back to args defaults."""
+    rover = getattr(ppo_rover, '_rover', None)
+    if rover is not None:
+        try:
+            pos = rover.get_gps_values(timeout_seconds=2.0, allow_fallback=True)
+            if pos.get('lat') is not None and pos.get('lon') is not None:
+                logging.info('GPS fix: lat=%.6f lon=%.6f source=%s', pos['lat'], pos['lon'], pos.get('source'))
+                return pos['lat'], pos['lon']
+        except Exception as exc:
+            logging.warning('GPS read failed: %s', exc)
+    logging.info('Using default coordinates: lat=%.6f lon=%.6f', args.latitude, args.longitude)
+    return args.latitude, args.longitude
+
+
+def call_send_request(args, image_path):
+    script = Path(args.send_request_script).expanduser()
+    if not script.exists() or not script.is_file():
+        return {'ok': False, 'reason': f'send_request script not found: {script}'}
+
+    lat, lon = _get_gps_coords(args)
+    cmd = [
+        sys.executable,
+        str(script),
+        '--url', args.plant_api_url,
+        '--latitude', str(lat),
+        '--longitude', str(lon),
+        '--image', str(image_path),
+        '-v',
+    ]
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    result = {
+        'ok': proc.returncode == 0,
+        'returncode': proc.returncode,
+        'stdout': proc.stdout.strip(),
+        'stderr': proc.stderr.strip(),
+    }
+    return result
+
+
+def pipeline_worker(args, stop_event):
+    last_sent_ts = 0.0
+
+    while not stop_event.is_set():
+        # Wait for ppo_rover to finish the approach and save the image
+        capture_event = getattr(ppo_rover, '_capture_event', None)
+        if capture_event is None:
+            time.sleep(args.poll_interval)
+            continue
+
+        fired = capture_event.wait(timeout=args.poll_interval)
+        if not fired:
+            continue
+
+        capture_event.clear()
+
+        now = time.time()
+        if now - last_sent_ts < args.cooldown_seconds:
+            logging.info('Plant capture ignored — cooldown (%.1fs left).', args.cooldown_seconds - (now - last_sent_ts))
+            # consume the flag so rover doesn't think it's still pending
+            consume_plant_found_flag()
+            continue
+
+        # Use the image saved by the approach routine (already a close-up shot)
+        image_path = getattr(ppo_rover, '_captured_image_path', None)
+        if not image_path or not Path(image_path).exists():
+            logging.warning('_capture_event fired but _captured_image_path missing — falling back to stream')
+            image_path = save_latest_stream_frame(args.capture_dir)
+        consume_plant_found_flag()
+
+        if image_path is None:
+            logging.warning('No image available to send.')
+            continue
+
+        # ── Gemini disease detection ───────────────────────────────────────
+        api_key = os.getenv('OPENROUTER_API_KEY')
+        if api_key:
+            logging.info('Running Gemini disease detection on %s', image_path)
+            ai_result = call_openrouter(image_path, args.openrouter_model, args.openrouter_timeout)
+            if not ai_result.get('ok'):
+                logging.warning('Gemini call failed: %s — skipping send', ai_result.get('reason'))
+                if args.once:
+                    stop_event.set()
+                time.sleep(args.poll_interval)
+                continue
+
+            ai_text = ai_result.get('text', '')
+            logging.info('Gemini response: %s', ai_text)
+
+            if not ai_response_indicates_disease(ai_text):
+                logging.info('No disease detected — image NOT sent to API.')
+                if args.once:
+                    stop_event.set()
+                time.sleep(args.poll_interval)
+                continue
+
+            logging.info('DISEASE detected — sending to API.')
+        else:
+            logging.warning('OPENROUTER_API_KEY not set — skipping disease check, sending all plant images.')
+
+        # ── Send to backend API ────────────────────────────────────────────
+        send_result = call_send_request(args, image_path)
+        if send_result.get('ok'):
+            logging.info('Sent to server successfully.')
+            logging.info('API response:\n%s', send_result.get('stdout', '(empty)'))
+            last_sent_ts = time.time()
+        else:
+            logging.warning('send_request FAILED (rc=%s)', send_result.get('returncode'))
+            logging.warning('stdout: %s', send_result.get('stdout', ''))
+            logging.warning('stderr: %s', send_result.get('stderr', ''))
+
+        if args.once:
+            stop_event.set()
+
+        time.sleep(args.poll_interval)
+
+
+def main():
+    args = parse_args()
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s %(levelname)s %(message)s',
+        datefmt='%H:%M:%S',
+    )
+
+    load_env_file(args.env_file)
+    install_plant_found_hook()
+
+    stop_event = threading.Event()
+    worker = threading.Thread(target=pipeline_worker, args=(args, stop_event), daemon=True)
+    worker.start()
+
+    if args.disable_ppo:
+        logging.info('PPO disabled. Waiting for manual stop.')
+        try:
+            while not stop_event.is_set():
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            logging.info('Interrupted.')
+            stop_event.set()
+        return 0
+
+    logging.info('Starting ppo_rover in-process...')
+    try:
+        ppo_rover.main()
+    except KeyboardInterrupt:
+        logging.info('Interrupted.')
+    finally:
+        stop_event.set()
+        worker.join(timeout=2.0)
+
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

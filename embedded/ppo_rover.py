@@ -1,19 +1,13 @@
-#!/usr/bin/env python3
+#!/home/yasen/.venv/bin/python3
 """
-Online PPO self-driving rover controller (pure numpy).
+Stable-Baselines3 PPO rover controller.
 
-Observation (16-dim, all [0, 1]):
-  [rf_L, rf_F, rf_R,
-   plant_L, plant_C, plant_R,
-   tree_L,  tree_C,  tree_R,
-   hazard_L, hazard_C, hazard_R,
-   crop_L,  crop_R,
-   free_path_C,
-   vx_capped]
-
-Actions : 9 discrete (left_motor x right_motor) combinations
-Safety  : hard deterministic override before every motor command
-Speed   : forward PWM scales with free_path_C in [MIN_FWD_DUTY, MAX_FWD_DUTY] = [30, 80] %
+- PPO via stable-baselines3 (PyTorch backend, far more efficient than numpy)
+- Gymnasium custom environment wrapping rover hardware
+- Deterministic safety / hazard / GreenNavigator overrides inside env.step()
+- Per-step YOLO logging to console
+- Live stream on port 5000 with YOLO bounding boxes drawn on frames
+- Fixed reward: alignment terms only fire when green is actually visible
 """
 
 import json
@@ -24,192 +18,88 @@ import sys
 import time
 import signal
 import logging
+import threading
 
 import cv2
 import numpy as np
+import gymnasium
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from api import RoverAPI
 from vision import VisionPipeline, VisionFeatures, ZERO_VISION
 
-# ── CONSTANTS ─────────────────────────────────────────────────────────────────
-SENSOR_MAX_CM  = 30.0
-SAFETY_CM      = 15.0    # left/right spin threshold (cm)
-FRONT_SAFETY_CM = 25.0   # front backward threshold — larger for more reaction time
-TIMESTEP_S     = 0.05
-STREAM_PORT    = 5000
-JPEG_QUALITY   = 70
+# ── CONSTANTS ──────────────────────────────────────────────────────────────────
+SENSOR_MAX_CM   = 30.0
+SAFETY_CM       = 15.0
+FRONT_SAFETY_CM = 25.0
+TIMESTEP_S      = 0.05
+NOISE_STD       = 0.02
+MIN_FWD_DUTY    = 50.0
+MAX_FWD_DUTY    = 70.0
+
+# ── CAPTURE APPROACH CONSTANTS ─────────────────────────────────────────────
+PROX_TRIGGER_CM    = 55.0   # front sensor cm that starts an approach
+APPROACH_STOP_CM   = 40.0   # stop inside 30-50 cm window (centre = 40 cm)
+SPIN_180_S         = 1.8    # seconds to spin ~180° after capture (tune if needed)
+CAPTURE_COOLDOWN_S = 15.0   # minimum gap between captures (seconds)
+
+OBS_DIM   = 16
+N_ACTIONS = 9
+
+STREAM_PORT      = 5000
+JPEG_QUALITY     = 70
 FRAME_W, FRAME_H = 640, 480
-NOISE_STD      = 0.02
-MIN_FWD_DUTY   = 35.0    # minimum forward PWM (%)
-MAX_FWD_DUTY   = 55.0    # maximum forward PWM (%)
 
-OBS_DIM    = 16
-HIDDEN_DIM = 64
-N_ACTIONS  = 9
+YOLO_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yolo11n.pt')
+CHECKPOINT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ppo_sb3')
 
-LR           = 3e-4
-GAMMA        = 0.99
-LAM          = 0.95
-CLIP_EPS     = 0.20
-ENTROPY_COEF = 0.05
-VALUE_COEF   = 0.50
-BUFFER_SIZE  = 64
-PPO_EPOCHS   = 4
-MINIBATCH    = 16
-
-YOLO_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'yolov8n.pt')
-
-# ── ACTION TABLE ──────────────────────────────────────────────────────────────
+# ── ACTION TABLE ───────────────────────────────────────────────────────────────
 ACTIONS = [
-    (-1, -1),   # 0  both backward
-    (-1,  0),   # 1  left back, right stop
-    (-1,  1),   # 2  spin left
-    ( 0, -1),   # 3  left stop, right back
-    ( 0,  0),   # 4  full stop
-    ( 0,  1),   # 5  gentle right turn
-    ( 1, -1),   # 6  spin right
-    ( 1,  0),   # 7  gentle left turn
-    ( 1,  1),   # 8  both forward
+    (-1, -1),  # 0  both backward
+    (-1,  0),  # 1  left back, right stop
+    (-1,  1),  # 2  spin left
+    ( 0, -1),  # 3  left stop, right back
+    ( 0,  0),  # 4  full stop
+    ( 0,  1),  # 5  gentle right turn
+    ( 1, -1),  # 6  spin right
+    ( 1,  0),  # 7  gentle left turn
+    ( 1,  1),  # 8  both forward
 ]
 
 ACT_BACKWARD     = 0
 ACT_SPIN_LEFT    = 2
 ACT_SPIN_RIGHT   = 6
-ACT_GENTLE_RIGHT = 5   # left=stop, right=fwd 2192 arcs left
-ACT_GENTLE_LEFT  = 7   # left=fwd, right=stop 2192 arcs right
+ACT_GENTLE_RIGHT = 5
+ACT_GENTLE_LEFT  = 7
 ACT_FORWARD      = 8
-
-# Actions that move backward voluntarily (blocked unless safety triggers)
-_VOLUNTARY_BACKWARD = {0, 1, 3}  # both-back, left-back, right-back
 
 _CMD = {-1: 'backward', 0: 'stop', 1: 'forward'}
 
-
-# ── ACTOR-CRITIC ──────────────────────────────────────────────────────────────
-class ActorCritic:
-    """Linear(16->64)->ReLU->{ Actor: Linear(64->9), Critic: Linear(64->1) }"""
-
-    def __init__(self, lr=LR):
-        rng   = np.random.default_rng(0)
-        scale = np.sqrt(2.0 / OBS_DIM)
-
-        self.W1 = rng.standard_normal((OBS_DIM,    HIDDEN_DIM)) * scale
-        self.b1 = np.zeros(HIDDEN_DIM)
-        self.Wa = rng.standard_normal((HIDDEN_DIM, N_ACTIONS))  * 0.01
-        self.ba = np.zeros(N_ACTIONS)
-        self.Wv = rng.standard_normal((HIDDEN_DIM, 1))          * 1.0
-        self.bv = np.zeros(1)
-
-        self._params = [self.W1, self.b1, self.Wa, self.ba, self.Wv, self.bv]
-        self._m = [np.zeros_like(p) for p in self._params]
-        self._v = [np.zeros_like(p) for p in self._params]
-        self._t = 0
-        self.lr = lr
-
-    def _fwd(self, x):
-        h_pre  = x @ self.W1 + self.b1
-        h      = np.maximum(0.0, h_pre)
-        logits = h @ self.Wa + self.ba
-        values = (h @ self.Wv + self.bv).ravel()
-        return logits, values, h, h_pre
-
-    @staticmethod
-    def _softmax(logits):
-        e = np.exp(logits - logits.max(axis=1, keepdims=True))
-        return e / e.sum(axis=1, keepdims=True)
-
-    def act(self, obs):
-        x = obs[None].astype(np.float32)
-        logits, values, _, _ = self._fwd(x)
-        probs      = self._softmax(logits)[0]
-        action_idx = int(np.random.choice(N_ACTIONS, p=probs))
-        log_prob   = float(np.log(probs[action_idx] + 1e-8))
-        return action_idx, log_prob, float(values[0])
-
-    def update(self, obs_b, act_b, logp_old_b, ret_b, adv_b):
-        B = len(act_b)
-        x   = obs_b.astype(np.float32)
-        ret = ret_b.astype(np.float32)
-        adv = adv_b.astype(np.float32)
-
-        logits, values, h, h_pre = self._fwd(x)
-        probs     = self._softmax(logits)
-        log_probs = np.log(probs + 1e-8)
-        logp_new  = log_probs[np.arange(B), act_b]
-
-        ratio         = np.exp(logp_new - logp_old_b)
-        clipped_ratio = np.clip(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS)
-        is_clipped    = (ratio * adv) > (clipped_ratio * adv)
-        entropy       = -(probs * log_probs).sum(axis=1)
-
-        d_val      = VALUE_COEF * (values - ret) / B
-        d_logp     = np.where(is_clipped, 0.0, -adv * ratio) / B
-        d_logits_e = (ENTROPY_COEF / B) * probs * (log_probs + entropy[:, None])
-
-        one_hot          = np.zeros((B, N_ACTIONS), dtype=np.float32)
-        one_hot[np.arange(B), act_b] = 1.0
-        d_logits         = d_logp[:, None] * (one_hot - probs) + d_logits_e
-
-        dWa  = h.T @ d_logits
-        dba  = d_logits.sum(axis=0)
-        d_h  = d_logits @ self.Wa.T
-        dWv  = h.T @ d_val[:, None]
-        dbv  = np.array([d_val.sum()])
-        d_h += d_val[:, None] * self.Wv.T
-
-        d_hp = d_h * (h_pre > 0).astype(np.float32)
-        dW1  = x.T @ d_hp
-        db1  = d_hp.sum(axis=0)
-
-        self._adam([dW1, db1, dWa, dba, dWv, dbv])
-
-    def _adam(self, grads, beta1=0.9, beta2=0.999, eps=1e-8):
-        self._t += 1
-        bc1 = 1.0 - beta1 ** self._t
-        bc2 = 1.0 - beta2 ** self._t
-        for i, (p, g) in enumerate(zip(self._params, grads)):
-            self._m[i] = beta1 * self._m[i] + (1 - beta1) * g
-            self._v[i] = beta2 * self._v[i] + (1 - beta2) * g ** 2
-            p -= self.lr * (self._m[i] / bc1) / (np.sqrt(self._v[i] / bc2) + eps)
-
-    def save(self, path):
-        np.savez(path, W1=self.W1, b1=self.b1,
-                 Wa=self.Wa, ba=self.ba, Wv=self.Wv, bv=self.bv)
-
-    def load(self, path):
-        """Returns True on success, False on shape mismatch."""
-        d = np.load(path)
-        expected = {
-            'W1': (OBS_DIM, HIDDEN_DIM), 'b1': (HIDDEN_DIM,),
-            'Wa': (HIDDEN_DIM, N_ACTIONS), 'ba': (N_ACTIONS,),
-            'Wv': (HIDDEN_DIM, 1), 'bv': (1,),
-        }
-        for name, shape in expected.items():
-            if name not in d or d[name].shape != shape:
-                return False
-        for name in expected:
-            getattr(self, name)[:] = d[name]
-        return True
-
-
-# ── SENSOR HELPERS ────────────────────────────────────────────────────────────
+# ── SENSOR HELPERS ─────────────────────────────────────────────────────────────
 def _norm(dist_cm):
     if dist_cm is None:
-        return 1.0  # timeout = nothing detected = max range
+        return 1.0
     return float(min(dist_cm, SENSOR_MAX_CM) / SENSOR_MAX_CM)
-
 
 def read_sensors(rover):
     raw = rover.get_ultrasonic()
-    # None (timeout) = nothing in range → treat as max range, not collision
     L = raw.get(1) if raw.get(1) is not None else SENSOR_MAX_CM
     F = raw.get(3) if raw.get(3) is not None else SENSOR_MAX_CM
     R = raw.get(2) if raw.get(2) is not None else SENSOR_MAX_CM
     return (L, F, R), np.array([_norm(L), _norm(F), _norm(R)], dtype=np.float32)
 
+def fwd_duty(free_path_C):
+    return MIN_FWD_DUTY + (MAX_FWD_DUTY - MIN_FWD_DUTY) * float(free_path_C)
 
-# ── OBSERVATION BUILDER ───────────────────────────────────────────────────────
+def action_to_vx(action_idx, duty=None):
+    if duty is None:
+        duty = MIN_FWD_DUTY
+    lc, rc = ACTIONS[action_idx]
+    return duty / 100.0 if (lc == 1 and rc == 1) else 0.0
+
+# ── OBSERVATION BUILDER ────────────────────────────────────────────────────────
 def build_obs(sensor_obs, vf, vx_capped):
     return np.array([
         sensor_obs[0], sensor_obs[1], sensor_obs[2],
@@ -221,72 +111,44 @@ def build_obs(sensor_obs, vf, vx_capped):
         vx_capped,
     ], dtype=np.float32)
 
-
-# ── SAFETY OVERRIDE ───────────────────────────────────────────────────────────
+# ── SAFETY OVERRIDE ────────────────────────────────────────────────────────────
 def safety_override(raw_L, raw_F, raw_R):
-    # Backward ONLY when front sensor detects danger
     if raw_F < FRONT_SAFETY_CM:
-        return ACT_BACKWARD,   True
-    # Spin away from left/right obstacles
+        return ACT_BACKWARD, True
     if raw_L < SAFETY_CM:
         return ACT_SPIN_RIGHT, True
     if raw_R < SAFETY_CM:
-        return ACT_SPIN_LEFT,  True
+        return ACT_SPIN_LEFT, True
     return None, False
 
-
-# ── HAZARD STEER OVERRIDE ────────────────────────────────────────────────────
-HAZARD_STEER_THR  = 0.25  # min hazard_C score to trigger steering
-GREEN_SEEK_THR    = 0.15  # min total green score to activate seeking
-GREEN_ORBIT_THR   = 0.20  # center green threshold to start orbit
-GREEN_SIDE_BIAS   = 0.12  # L-R imbalance to steer toward a side
-ORBIT_SPIN_STEPS  = 5     # spin steps per orbit cycle
+# ── HAZARD STEER OVERRIDE ──────────────────────────────────────────────────────
+HAZARD_STEER_THR  = 0.25
+GREEN_SEEK_THR    = 0.15
+GREEN_ORBIT_THR   = 0.20
+GREEN_SIDE_BIAS   = 0.12
+ORBIT_SPIN_STEPS  = 5
 
 def hazard_steer_override(vf):
-    """
-    When a hazard (person/chair/table) is detected ahead, spin around it
-    instead of reversing. Steers toward the clearer side.
-    Returns (action_idx | None, triggered: bool).
-    """
     if vf.hazard_C < HAZARD_STEER_THR:
         return None, False
-    # Spin toward the side with less hazard
     if vf.hazard_L <= vf.hazard_R:
-        return ACT_SPIN_LEFT, True   # less hazard on left → spin left
+        return ACT_SPIN_LEFT, True
     else:
-        return ACT_SPIN_RIGHT, True  # less hazard on right → spin right
+        return ACT_SPIN_RIGHT, True
 
+# ── GREEN NAVIGATOR ────────────────────────────────────────────────────────────
+GN_DETECT_THR   = 0.06   # lowered: catch smaller/partial plant detections
+GN_CENTER_THR   = 0.18
+GN_ORBIT_THR    = 0.25
+GN_SCAN_SPIN    = 10
+GN_REPOSE_STEPS = 8
+GN_APPROACH_MAX = 15
 
-# ── GREEN NAVIGATOR ─────────────────────────────────────────────────────────────────────
-GN_DETECT_THR   = 0.12   # total YOLO green to consider plant found
-GN_CENTER_THR   = 0.18   # center green to start approaching
-GN_ORBIT_THR    = 0.25   # center green to lock into orbit
-GN_SCAN_SPIN    = 10     # steps to spin per scan phase
-GN_REPOSE_STEPS = 8      # backward steps when plant is lost
-GN_APPROACH_MAX = 15     # max forward steps before forcing orbit
-
-_GN_SCAN     = 0
-_GN_SEEK     = 1
-_GN_APPROACH = 2
-_GN_ORBIT    = 3
-_GN_REPOSE   = 4
-_GN_NAMES    = ['scan', 'seek', 'approach', 'orbit', 'repose']
+_GN_SCAN, _GN_SEEK, _GN_APPROACH, _GN_ORBIT, _GN_REPOSE = 0, 1, 2, 3, 4
+_GN_NAMES = ['scan', 'seek', 'approach', 'orbit', 'repose']
 
 
 class GreenNavigator:
-    """
-    Deterministic finite-state machine for plant-finding and orbiting.
-
-    SCAN     : No green visible. Alternates spin + forward to survey.
-    SEEK     : Green on one side — steers toward it.
-    APPROACH : Green centred ahead — drives straight toward it.
-    ORBIT    : Plant well-centred — arcs around it continuously.
-    REPOSE   : Just lost the plant — backs up, then returns to SCAN.
-
-    Always returns an action (triggered=True), so PPO is only active
-    as a background learner while this controller drives.
-    """
-
     def __init__(self):
         self._state      = _GN_SCAN
         self._scan_tick  = 0
@@ -307,7 +169,6 @@ class GreenNavigator:
         total_g  = left_g + center_g + right_g
         found    = total_g >= GN_DETECT_THR
 
-        # Print to console on first detection
         if found and not self._was_found and announce:
             announce(
                 f'{"=" * 52}\n'
@@ -317,12 +178,10 @@ class GreenNavigator:
             )
         self._was_found = found
 
-        # ── Transitions ───────────────────────────────────────────────────
         if self._state == _GN_SCAN:
             if found:
                 self._state     = _GN_SEEK
                 self._scan_tick = 0
-
         elif self._state == _GN_SEEK:
             if not found:
                 self._state    = _GN_REPOSE
@@ -330,170 +189,155 @@ class GreenNavigator:
             elif center_g >= GN_CENTER_THR:
                 self._state      = _GN_APPROACH
                 self._approach_n = 0
-
         elif self._state == _GN_APPROACH:
             if not found:
                 self._state    = _GN_REPOSE
                 self._repose_n = GN_REPOSE_STEPS
             elif center_g >= GN_ORBIT_THR or self._approach_n >= GN_APPROACH_MAX:
-                self._orbit_dir = (ACT_GENTLE_LEFT if right_g >= left_g
-                                   else ACT_GENTLE_RIGHT)
+                self._orbit_dir = (ACT_GENTLE_LEFT if right_g >= left_g else ACT_GENTLE_RIGHT)
                 self._state = _GN_ORBIT
             else:
                 self._approach_n += 1
-
         elif self._state == _GN_ORBIT:
             if not found:
                 self._state    = _GN_REPOSE
                 self._repose_n = GN_REPOSE_STEPS
-
         elif self._state == _GN_REPOSE:
             self._repose_n -= 1
             if self._repose_n <= 0:
                 self._state = _GN_SCAN
 
-        # ── Action selection ──────────────────────────────────────────────
         if self._state == _GN_SCAN:
             self._scan_tick += 1
             phase = self._scan_tick % (GN_SCAN_SPIN * 2)
             if phase == 0:
-                self._scan_dir = (ACT_SPIN_RIGHT if self._scan_dir == ACT_SPIN_LEFT
-                                  else ACT_SPIN_LEFT)
+                self._scan_dir = (ACT_SPIN_RIGHT if self._scan_dir == ACT_SPIN_LEFT else ACT_SPIN_LEFT)
             return (self._scan_dir if phase < GN_SCAN_SPIN else ACT_FORWARD), True
-
         if self._state == _GN_SEEK:
             if left_g > right_g + 0.05:
                 return ACT_GENTLE_LEFT, True
             if right_g > left_g + 0.05:
                 return ACT_GENTLE_RIGHT, True
             return ACT_FORWARD, True
-
         if self._state == _GN_APPROACH:
             return ACT_FORWARD, True
-
         if self._state == _GN_ORBIT:
             if center_g < 0.08:
-                return (ACT_GENTLE_LEFT if left_g >= right_g
-                        else ACT_GENTLE_RIGHT), True
+                return (ACT_GENTLE_LEFT if left_g >= right_g else ACT_GENTLE_RIGHT), True
             return self._orbit_dir, True
-
         if self._state == _GN_REPOSE:
             return ACT_BACKWARD, True
-
         return ACT_FORWARD, True
 
 
-
-
-# ── REWARD ────────────────────────────────────────────────────────────────────
+# ── REWARD ─────────────────────────────────────────────────────────────────────
 def compute_reward(raw_sensors, vf, action_idx, safety_triggered,
                    prev_center=0.0, prev_action=None):
     raw_L, raw_F, raw_R = raw_sensors
     left_cmd, right_cmd = ACTIONS[action_idx]
     r = 0.0
 
-    # 1. Survival bonus — stabilises training, encourages long safe runs
-    r += 0.02
-
-    # 2. Forward motion (0.10 -> 0.20: competes better against vision rewards)
-    if left_cmd == 1 and right_cmd == 1:
-        r += 0.20
-
-    # 3. Temporal progress — reward approaching green, penalise drifting away
-    #    This is the highest-impact term: agent must MOVE toward green, not just see it.
-    current_center = vf.plant_C + vf.tree_C
-    delta_center   = current_center - prev_center
-    r += 0.30 * delta_center
-
-    # 4. Static green centering (reduced from 0.45 — progress signal covers approach)
-    r += 0.25 * (1.0 - abs(vf.plant_L - vf.plant_R))   # lateral alignment
-    r += 0.25 * (1.0 - abs(vf.tree_L  - vf.tree_R))
-    r += 0.30 * (vf.plant_C + vf.tree_C)                # centering bonus
-
-    # 5. Side green presence (0.20 -> 0.10: reduce passive-sit reward)
-    r += 0.10 * (vf.plant_L + vf.plant_R + vf.tree_L + vf.tree_R)
-
-    # 6. Crop-row following (reduced: 0.15 -> 0.08 presence bonus)
-    r += 0.15 * (1.0 - abs(vf.crop_L - vf.crop_R))
-    r += 0.08 * (vf.crop_L + vf.crop_R)
-
-    # 7. Free path ahead
-    r += 0.15 * vf.free_path_C
-
-    # 8. Proportional steering toward green (was binary +0.15)
-    #    Scales continuously with how correct the turn direction is
-    lc_sign     = 1 if left_cmd == 1 else (-1 if left_cmd == -1 else 0)
-    rc_sign     = 1 if right_cmd == 1 else (-1 if right_cmd == -1 else 0)
-    turn_dir    = (rc_sign - lc_sign) / 2.0   # +1 = right, -1 = left, 0 = straight
-    left_green  = vf.plant_L + vf.tree_L
-    right_green = vf.plant_R + vf.tree_R
-    r += 0.20 * (right_green - left_green) * turn_dir
-
-    # 9. No-green penalty
     green_total   = (vf.plant_L + vf.plant_C + vf.plant_R
                      + vf.tree_L + vf.tree_C + vf.tree_R)
     crop_presence = vf.crop_L + vf.crop_R
-    if green_total < 0.10 and crop_presence < 0.05:
-        r -= 0.40
 
-    # 10. Smoothness — penalise jitter / rapid action switching
+    # 1. Forward motion
+    if left_cmd == 1 and right_cmd == 1:
+        r += 0.20
+
+    # 2. Temporal progress toward green
+    current_center = vf.plant_C + vf.tree_C
+    r += 0.30 * (current_center - prev_center)
+
+    # 3. Green centering — ONLY fires when green is actually visible
+    if green_total > 0.05:
+        r += 0.25 * (1.0 - abs(vf.plant_L - vf.plant_R))
+        r += 0.25 * (1.0 - abs(vf.tree_L  - vf.tree_R))
+        r += 0.30 * (vf.plant_C + vf.tree_C)
+        r += 0.10 * (vf.plant_L + vf.plant_R + vf.tree_L + vf.tree_R)
+        # Steer toward green side
+        lc_sign   = 1 if left_cmd == 1 else (-1 if left_cmd == -1 else 0)
+        rc_sign   = 1 if right_cmd == 1 else (-1 if right_cmd == -1 else 0)
+        turn_dir  = (rc_sign - lc_sign) / 2.0
+        r += 0.20 * ((vf.plant_R + vf.tree_R) - (vf.plant_L + vf.tree_L)) * turn_dir
+
+    # 4. Crop-row following — ONLY fires when crops visible
+    if crop_presence > 0.05:
+        r += 0.15 * (1.0 - abs(vf.crop_L - vf.crop_R))
+        r += 0.08 * crop_presence
+
+    # 5. Free path bonus — only when moving forward
+    if left_cmd == 1 and right_cmd == 1:
+        r += 0.15 * vf.free_path_C
+
+    # 6. No-green penalty (stronger: was -0.40)
+    if green_total < 0.05 and crop_presence < 0.05:
+        r -= 0.60
+
+    # 7. Smoothness
     if prev_action is not None and action_idx != prev_action:
         r -= 0.05
 
-    # 11. Hazard penalty (smoothed + capped: was uncapped 0.5 * sum)
+    # 8. Hazard penalty
     r -= 1.0 * min(1.0, vf.hazard_L + vf.hazard_C + vf.hazard_R)
 
-    # 12. Light backward discouragement (backward is now used for repositioning)
+    # 9. Backward discouragement
     if left_cmd == -1 and right_cmd == -1 and not safety_triggered:
         r -= 0.08
 
-    # 13. Continuous collision shaping (was -1.0 hard threshold at 20%)
-    #     "Closer = worse" learned continuously, not as sudden fear
+    # 10. Collision shaping
     r -= 1.0 * (1.0 - _norm(raw_F))
+
+    # 11. Same-direction spin penalty
+    if (prev_action is not None
+            and action_idx in {ACT_SPIN_LEFT, ACT_SPIN_RIGHT}
+            and action_idx == prev_action):
+        r -= 0.30
 
     return r
 
 
-# ── GAE ───────────────────────────────────────────────────────────────────────
-def compute_gae(rewards, values, next_value):
-    T   = len(rewards)
-    adv = np.zeros(T, dtype=np.float32)
-    gae = 0.0
-    for t in reversed(range(T)):
-        nv    = next_value if t == T - 1 else values[t + 1]
-        delta = rewards[t] + GAMMA * nv - values[t]
-        gae   = delta + GAMMA * LAM * gae
-        adv[t] = gae
-    returns = adv + np.array(values, dtype=np.float32)
-    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-    return adv, returns
-
-
-def fwd_duty(free_path_C):
-    # Scale forward PWM with path clarity: 30% (blocked) -> 80% (clear)
-    return MIN_FWD_DUTY + (MAX_FWD_DUTY - MIN_FWD_DUTY) * float(free_path_C)
-
-
-def action_to_vx(action_idx, duty=None):
-    if duty is None:
-        duty = MIN_FWD_DUTY
-    lc, rc = ACTIONS[action_idx]
-    return duty / 100.0 if (lc == 1 and rc == 1) else 0.0
-
-
-
-# ── STREAM SERVER ─────────────────────────────────────────────────────────────
+# ── STREAM SERVER ──────────────────────────────────────────────────────────────
 _stream_state = {'frame_jpeg': None, 'meta': b'{}', 'lock': None}
 
+
+def _annotate_frame(frame_bgr, detections, src_w, src_h):
+    """Draw YOLO bounding boxes on an already-resized BGR frame."""
+    dh, dw = frame_bgr.shape[:2]
+    sx, sy = dw / src_w, dh / src_h
+    _plant_kws = (
+        'plant', 'flower', 'shrub', 'potted', 'vase',
+        'banana', 'apple', 'orange', 'broccoli', 'carrot',
+        'fruit', 'vegetable', 'crop', 'vine', 'leaf', 'grass',
+        'bush', 'weed', 'herb', 'tomato', 'lettuce', 'cabbage',
+        'celery', 'cucumber', 'pepper', 'pumpkin', 'squash',
+        'berry', 'cherry', 'grape', 'lemon', 'mango', 'melon',
+        'pear', 'pineapple', 'strawberry', 'watermelon',
+    )
+    for name, conf, x1, y1, x2, y2 in detections:
+        bx1, by1 = int(x1 * sx), int(y1 * sy)
+        bx2, by2 = int(x2 * sx), int(y2 * sy)
+        if any(kw in name for kw in _plant_kws):
+            color = (0, 200, 0)    # green
+        elif 'tree' in name:
+            color = (0, 150, 50)   # dark green
+        else:
+            color = (0, 0, 220)    # red for hazard
+        cv2.rectangle(frame_bgr, (bx1, by1), (bx2, by2), color, 2)
+        cv2.putText(frame_bgr, f'{name} {conf:.2f}',
+                    (bx1, max(by1 - 5, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+    return frame_bgr
+
+
 def _serve_client(conn):
-    import time as _t
     try:
         while True:
             with _stream_state['lock']:
                 jpeg = _stream_state['frame_jpeg']
                 meta = _stream_state['meta']
             if jpeg is None:
-                _t.sleep(0.01)
+                time.sleep(0.01)
                 continue
             conn.sendall(struct.pack('>I', len(meta)))
             conn.sendall(meta)
@@ -504,196 +348,358 @@ def _serve_client(conn):
     finally:
         conn.close()
 
+
 def _stream_server_thread():
-    import threading as _th
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(('0.0.0.0', STREAM_PORT))
     srv.listen(4)
-    log.info(f'Stream server listening on :{STREAM_PORT}')
+    log.info(f'Stream server on :{STREAM_PORT}')
     while True:
         try:
             conn, addr = srv.accept()
             log.info(f'Viewer connected from {addr}')
-            _th.Thread(target=_serve_client, args=(conn,), daemon=True).start()
+            threading.Thread(target=_serve_client, args=(conn,), daemon=True).start()
         except Exception:
             pass
 
-# ── CONTROL LOOP ──────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(message)s',
-                    datefmt='%H:%M:%S')
+
+# ── GLOBALS ────────────────────────────────────────────────────────────────────
+plant_found           = False
+_rover                = None          # set by main(); orchestrator reads GPS from here
+_capture_event        = threading.Event()   # set after approach+capture; orchestrator waits on this
+_captured_image_path  = None          # kept for compatibility
+_captured_image_bytes = None          # in-memory JPEG bytes; orchestrator reads this
+
+# YOLO classes that count as a plant/veg/fruit detection worth sending
+_PLANT_SEND_KEYWORDS = frozenset({
+    'plant', 'potted', 'vase',
+    'banana', 'apple', 'orange', 'broccoli', 'carrot', 'tomato',
+    'lettuce', 'cabbage', 'celery', 'cucumber', 'pepper', 'pumpkin',
+    'squash', 'berry', 'cherry', 'grape', 'lemon', 'mango', 'melon',
+    'pear', 'pineapple', 'strawberry', 'watermelon',
+    'fruit', 'vegetable', 'crop', 'vine', 'leaf', 'grass',
+    'bush', 'weed', 'herb', 'flower', 'shrub', 'tree',
+})
+_PLANT_SEND_CONF = 0.20   # minimum YOLO confidence to trigger approach+capture
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s  %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger('ppo_rover')
 
-CHECKPOINT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ppo_weights.npz')
 
+# ── GYMNASIUM ENVIRONMENT ──────────────────────────────────────────────────────
+class RoverEnv(gymnasium.Env):
+    metadata = {}
 
-def main():
-    rover  = RoverAPI()
-    model  = ActorCritic()
-    vision = VisionPipeline(model_path=YOLO_MODEL)
+    def __init__(self, rover, vision):
+        super().__init__()
+        self.observation_space = gymnasium.spaces.Box(0.0, 1.0, shape=(OBS_DIM,), dtype=np.float32)
+        self.action_space      = gymnasium.spaces.Discrete(N_ACTIONS)
+        self.rover  = rover
+        self.vision = vision
+        self._navigator           = GreenNavigator()
+        self._prev_center         = 0.0
+        self._prev_action         = None
+        self._prev_plant_detected = False
+        self._prev_prox_triggered = False
+        self._last_capture_ts     = 0.0
+        self._raw_sensors         = (SENSOR_MAX_CM, SENSOR_MAX_CM, SENSOR_MAX_CM)
+        self._vf                  = ZERO_VISION
+        self._t0                  = time.monotonic()
+        self._step_count          = 0
 
-    if os.path.exists(CHECKPOINT):
-        if model.load(CHECKPOINT):
-            log.info(f'Resumed from checkpoint: {CHECKPOINT}')
+    # ── Capture sensors + vision, update stream, return obs ───────────────────
+    def _capture(self):
+        (raw_L, raw_F, raw_R), sensor_obs = read_sensors(self.rover)
+        self._raw_sensors = (raw_L, raw_F, raw_R)
+        try:
+            raw_frame = np.array(self.rover.getframe(), dtype=np.uint8)
+            # Rotate 180° (camera is mounted upside-down) then convert RGB→BGR
+            raw_frame = cv2.flip(raw_frame, -1)
+            raw_frame = cv2.cvtColor(raw_frame, cv2.COLOR_RGB2BGR)
+            self._vf  = self.vision.update(raw_frame)
+            # Annotate and push to stream
+            if _stream_state['lock'] is not None:
+                dets, src_w, src_h = self.vision.get_detections()
+                bgr = cv2.resize(raw_frame, (FRAME_W, FRAME_H))
+                bgr = _annotate_frame(bgr, dets, src_w, src_h)
+                _, jpeg = cv2.imencode('.jpg', bgr, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                meta = json.dumps({
+                    'L': round(raw_L, 1), 'F': round(raw_F, 1), 'R': round(raw_R, 1)
+                }).encode()
+                with _stream_state['lock']:
+                    _stream_state['frame_jpeg'] = jpeg.tobytes()
+                    _stream_state['meta']       = meta
+        except Exception as _cam_exc:
+            log.warning('Camera frame failed: %s', _cam_exc)
+            self._vf = ZERO_VISION
+
+        vf  = self._vf
+        vx  = action_to_vx(self._prev_action or ACT_FORWARD, fwd_duty(vf.free_path_C))
+        obs = build_obs(sensor_obs, vf, vx)
+        return np.clip(
+            obs + np.random.normal(0, NOISE_STD, OBS_DIM).astype(np.float32),
+            0.0, 1.0,
+        )
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.rover.stop_motors()
+        self._navigator           = GreenNavigator()
+        self._prev_center         = 0.0
+        self._prev_action         = None
+        self._prev_plant_detected = False
+        self._prev_prox_triggered = False
+        self._t0                  = time.monotonic()
+        obs = self._capture()
+        return obs, {}
+
+    def step(self, action):
+        global plant_found
+        action    = int(action)
+        raw_L, raw_F, raw_R = self._raw_sensors
+        vf        = self._vf
+
+        # ── Deterministic overrides (same priority as before) ──────────────
+        safe_act, triggered = safety_override(raw_L, raw_F, raw_R)
+        if triggered:
+            final_action = safe_act
         else:
-            log.warning('Checkpoint shapes mismatch (obs_dim changed) — starting fresh.')
+            hazard_act, hazard_trig = hazard_steer_override(vf)
+            if hazard_trig:
+                final_action = hazard_act
+            else:
+                nav_act, nav_on = self._navigator.step(vf, announce=log.info)
+                final_action = nav_act if nav_on else action
+
+        # ── Drive ─────────────────────────────────────────────────────────
+        lc, rc = ACTIONS[final_action]
+        duty   = fwd_duty(vf.free_path_C)
+        self.rover.drive(_CMD[lc], _CMD[rc], left_speed=duty, right_speed=duty)
+
+        # ── Pace ──────────────────────────────────────────────────────────
+        elapsed = time.monotonic() - self._t0
+        slack   = TIMESTEP_S - elapsed
+        if slack > 0:
+            time.sleep(slack)
+        self._t0 = time.monotonic()
+
+        # ── New observation ────────────────────────────────────────────────
+        new_obs        = self._capture()
+        vf_new         = self._vf
+        raw_new        = self._raw_sensors
+
+        # ── Reward ────────────────────────────────────────────────────────
+        reward = compute_reward(
+            raw_new, vf_new, final_action, triggered,
+            self._prev_center, self._prev_action,
+        )
+        self._prev_center = vf_new.plant_C + vf_new.tree_C
+        self._prev_action = final_action
+        self._step_count += 1
+
+        # ── Per-step YOLO log ──────────────────────────────────────────────
+        dets, _, _ = self.vision.get_detections()
+        det_str    = ', '.join(f'{d[0]}:{d[1]:.2f}' for d in dets) if dets else 'none'
+        log.info(
+            f'step={self._step_count:6d}  '
+            f'yolo=[{det_str}]  '
+            f'plant=({vf_new.plant_L:.2f},{vf_new.plant_C:.2f},{vf_new.plant_R:.2f})  '
+            f'us=({raw_new[0]:.1f},{raw_new[1]:.1f},{raw_new[2]:.1f})cm  '
+            f'rew={reward:+.3f}  '
+            f'cmd=({_CMD[lc][:3]},{_CMD[rc][:3]})  '
+            f'nav={self._navigator.state_name}  '
+            f'plant_found={plant_found}'
+        )
+
+        # ── Capture trigger: proximity-based (primary) + YOLO nav-lock (fallback) ──
+        # Fires on the rising edge entering the 30-50 cm capture window,
+        # or when GreenNavigator locks onto a detected plant/object,
+        # subject to a per-capture cooldown so we don't re-trigger immediately.
+        from vision import PLANT_BBOX_THR
+        bbox_area  = self.vision.get_max_plant_bbox_area()
+        nav_locked = self._navigator.state_name in ('seek', 'approach', 'orbit')
+        raw_f      = self._raw_sensors[1]   # front sensor (cm)
+
+        # Primary trigger: any object enters the 30-55 cm capture zone
+        prox_triggered = 0.0 < raw_f <= PROX_TRIGGER_CM
+
+        cooldown_ok = (time.monotonic() - self._last_capture_ts) >= CAPTURE_COOLDOWN_S
+        rising_edge = (prox_triggered and not self._prev_prox_triggered) or                       (nav_locked and not self._prev_plant_detected)
+
+        if rising_edge and cooldown_ok:
+            self._approach_and_capture()
+            self._last_capture_ts = time.monotonic()
+
+        self._prev_prox_triggered = prox_triggered
+        self._prev_plant_detected = nav_locked
+
+        return new_obs, float(reward), False, False, {}
+
+    def _approach_and_capture(self):
+        """
+        Approach the nearest object, stop at 30-50 cm, burst-capture the
+        sharpest frame, then spin 180° and resume exploration.
+        """
+        global plant_found, _captured_image_path
+        APPROACH_TIMEOUT = 120     # max iterations (~6 s at 20 Hz)
+        STEER_CONF_THR   = 0.10   # any YOLO detection helps steer
+        FWD_SPEED        = 45
+        STEER_SPEED      = 42
+        CAPTURE_DIR      = os.path.dirname(os.path.abspath(__file__))
+        N_BURST          = 7
+        BURST_INTERVAL   = 0.12
+
+        log.info('[approach] Object in range — approaching to %gcm', APPROACH_STOP_CM)
+        self.rover.stop_motors()
+        time.sleep(0.15)
+
+        # ── Phase 1: close the gap to APPROACH_STOP_CM ───────────────────
+        for _ in range(APPROACH_TIMEOUT):
+            sensors  = self.rover.get_ultrasonic()
+            front_cm = sensors.get(3) if sensors.get(3) is not None else 999.0
+
+            if front_cm <= APPROACH_STOP_CM:
+                log.info('[approach] In capture window (front=%.1f cm)', front_cm)
+                break
+
+            # Steer toward highest-confidence detection (any class)
+            dets, w, _ = self.vision.get_detections()
+            if dets:
+                best = max(dets, key=lambda d: d[1])   # highest conf
+                name, conf, x1, y1, x2, y2 = best
+                cx_norm = ((x1 + x2) / 2.0) / max(w, 1)
+                if conf >= STEER_CONF_THR:
+                    if cx_norm < 0.37:
+                        self.rover.drive('backward', 'forward', left_speed=STEER_SPEED, right_speed=STEER_SPEED)
+                    elif cx_norm > 0.63:
+                        self.rover.drive('forward', 'backward', left_speed=STEER_SPEED, right_speed=STEER_SPEED)
+                    else:
+                        self.rover.drive('forward', 'forward', left_speed=FWD_SPEED, right_speed=FWD_SPEED)
+                else:
+                    self.rover.drive('forward', 'forward', left_speed=FWD_SPEED, right_speed=FWD_SPEED)
+            else:
+                self.rover.drive('forward', 'forward', left_speed=FWD_SPEED, right_speed=FWD_SPEED)
+
+            time.sleep(0.05)
+
+        self.rover.stop_motors()
+        time.sleep(0.4)   # let vibration settle before burst
+
+        # ── Phase 2: burst capture — pick sharpest frame, keep in memory ────
+        log.info('[approach] Burst capturing %d frames', N_BURST)
+        frames, scores = [], []
+        try:
+            for _ in range(N_BURST):
+                raw = np.array(self.rover.getframe(), dtype=np.uint8)
+                raw = cv2.flip(raw, -1)
+                raw = cv2.cvtColor(raw, cv2.COLOR_RGB2BGR)
+                gray  = cv2.cvtColor(raw, cv2.COLOR_BGR2GRAY)
+                score = cv2.Laplacian(gray, cv2.CV_64F).var()
+                frames.append(raw)
+                scores.append(score)
+                time.sleep(BURST_INTERVAL)
+
+            best = frames[int(np.argmax(scores))]
+            log.info('[approach] Sharpness: %s — best=%d',
+                     [f'{s:.0f}' for s in scores], int(np.argmax(scores)))
+
+            # CLAHE contrast normalisation
+            lab = cv2.cvtColor(best, cv2.COLOR_BGR2LAB)
+            l_ch, a_ch, b_ch = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            best  = cv2.cvtColor(cv2.merge([clahe.apply(l_ch), a_ch, b_ch]),
+                                 cv2.COLOR_LAB2BGR)
+
+            best = cv2.flip(best, -1)  # 180 rotate for app display
+            _, buf = cv2.imencode('.jpg', best, [cv2.IMWRITE_JPEG_QUALITY, 92])
+            global _captured_image_bytes
+            _captured_image_bytes = buf.tobytes()
+            log.info('[approach] Captured %d bytes in memory', len(_captured_image_bytes))
+        except Exception as exc:
+            log.error('[approach] Burst capture failed: %s', exc)
+            _captured_image_bytes = None
+
+        # ── Phase 3: turn ~180° and resume ───────────────────────────────
+        log.info('[approach] Spinning 180° (%.1fs)', SPIN_180_S)
+        self.rover.drive('forward', 'backward', left_speed=50, right_speed=50)
+        time.sleep(SPIN_180_S)
+        self.rover.stop_motors()
+        log.info('[approach] Resuming exploration')
+
+        plant_found = True
+        _capture_event.set()
+
+
+# ── STOP CALLBACK ──────────────────────────────────────────────────────────────
+class _StopOnEvent(BaseCallback):
+    def __init__(self, event):
+        super().__init__()
+        self._event = event
+
+    def _on_step(self) -> bool:
+        return not self._event.is_set()
+
+
+# ── MAIN ───────────────────────────────────────────────────────────────────────
+def main():
+    global _rover
+    rover  = RoverAPI()
+    _rover = rover
+    vision = VisionPipeline(model_path=YOLO_MODEL)
+    env    = RoverEnv(rover, vision)
+
+    checkpoint_zip = CHECKPOINT + '.zip'
+    if os.path.exists(checkpoint_zip):
+        model = PPO.load(CHECKPOINT, env=env)
+        log.info(f'Resumed SB3 checkpoint: {checkpoint_zip}')
     else:
+        model = PPO(
+            'MlpPolicy', env,
+            n_steps       = 64,
+            batch_size    = 16,
+            n_epochs      = 4,
+            gamma         = 0.99,
+            gae_lambda    = 0.95,
+            clip_range    = 0.20,
+            ent_coef      = 0.05,
+            vf_coef       = 0.50,
+            learning_rate = 3e-4,
+            policy_kwargs = dict(net_arch=[64]),
+            verbose       = 0,
+        )
         log.info('No checkpoint — training from scratch.')
 
-    obs_buf, act_buf, logp_buf, rew_buf, val_buf = [], [], [], [], []
-
-    step         = 0
-    ep_reward    = 0.0
-    safety_count = 0
-    green_count  = 0
-    running      = True
-    navigator    = GreenNavigator()
-    prev_center  = 0.0   # for temporal progress reward
-
-    # Watchdog: stops motors if main loop freezes for > 5 s
-    import threading
-    _last_tick = [time.monotonic()]
-    WATCHDOG_S = 5.0
-    def _watchdog():
-        while running:
-            time.sleep(1.0)
-            if time.monotonic() - _last_tick[0] > WATCHDOG_S:
-                log.error('Watchdog: main loop froze -- emergency stop')
-                try:
-                    rover.stop_motors()
-                except Exception:
-                    pass
-    threading.Thread(target=_watchdog, daemon=True).start()
-
+    # Stream server
     _stream_state['lock'] = threading.Lock()
     threading.Thread(target=_stream_server_thread, daemon=True).start()
 
+    # Graceful shutdown
+    stop_event = threading.Event()
     def _stop(sig, frame):
-        nonlocal running
-        running = False
-
+        stop_event.set()
     signal.signal(signal.SIGINT,  _stop)
     signal.signal(signal.SIGTERM, _stop)
-    log.info('PPO rover online. Ctrl-C to stop.')
+    log.info('PPO rover online (SB3). Ctrl-C to stop.')
+
+    ckpt_dir = os.path.dirname(CHECKPOINT)
+    callbacks = [
+        CheckpointCallback(save_freq=512, save_path=ckpt_dir, name_prefix='ppo_sb3'),
+        _StopOnEvent(stop_event),
+    ]
 
     try:
-        while running:
-            t0 = time.monotonic()
-
-            # 1. Ultrasonic sensors
-            (raw_L, raw_F, raw_R), sensor_obs = read_sensors(rover)
-
-            # 2. Camera + vision pipeline
-            try:
-                raw_frame = np.array(rover.getframe(), dtype=np.uint8)
-                vf = vision.update(raw_frame)
-                _frame_bgr = cv2.cvtColor(raw_frame, cv2.COLOR_RGB2BGR)
-                _frame_bgr = cv2.resize(_frame_bgr, (FRAME_W, FRAME_H))
-                _, _jpeg = cv2.imencode('.jpg', _frame_bgr,
-                                        [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-                _meta = json.dumps({'L': round(raw_L, 1),
-                                    'F': round(raw_F, 1),
-                                    'R': round(raw_R, 1)}).encode()
-                with _stream_state['lock']:
-                    _stream_state['frame_jpeg'] = _jpeg.tobytes()
-                    _stream_state['meta'] = _meta
-            except Exception:
-                vf = ZERO_VISION
-
-            # 3. Build 16-dim observation
-            vx_capped = action_to_vx(act_buf[-1], fwd_duty(vf.free_path_C)) if act_buf else 0.0
-            obs = build_obs(sensor_obs, vf, vx_capped)
-            obs_n = np.clip(
-                obs + np.random.normal(0, NOISE_STD, OBS_DIM).astype(np.float32),
-                0.0, 1.0,
-            )
-
-            # 4. PPO action
-            action_idx, log_prob, value = model.act(obs_n)
-
-            # 5. Safety override (ultrasonic — highest priority)
-            safe_act, triggered = safety_override(raw_L, raw_F, raw_R)
-            if triggered:
-                action_idx    = safe_act
-                safety_count += 1
-            else:
-                # Hazard steer (second priority)
-                hazard_act, hazard_triggered = hazard_steer_override(vf)
-                if hazard_triggered:
-                    action_idx = hazard_act
-                else:
-                    # GreenNavigator — primary deterministic controller
-                    nav_act, nav_on = navigator.step(vf, announce=log.info)
-                    if nav_on:
-                        action_idx = nav_act
-                        green_count += 1
-
-            # 6. Drive: forward PWM scales 30->80% with path clarity
-            lc, rc = ACTIONS[action_idx]
-            duty = fwd_duty(vf.free_path_C)
-            rover.drive(
-                _CMD[lc], _CMD[rc],
-                left_speed  = duty if lc == 1 else 100.0,
-                right_speed = duty if rc == 1 else 100.0,
-            )
-
-            # 7. Reward
-            prev_act   = act_buf[-1] if act_buf else None
-            reward     = compute_reward(
-                (raw_L, raw_F, raw_R), vf, action_idx, triggered,
-                prev_center, prev_act,
-            )
-            prev_center = vf.plant_C + vf.tree_C
-            ep_reward  += reward
-
-            obs_buf.append(obs_n); act_buf.append(action_idx)
-            logp_buf.append(log_prob); rew_buf.append(reward); val_buf.append(value)
-            step += 1
-
-            # 8. PPO update
-            if len(obs_buf) >= BUFFER_SIZE:
-                (_, nF, _), ns_obs = read_sensors(rover)
-                next_obs = build_obs(ns_obs, ZERO_VISION, action_to_vx(act_buf[-1]))
-                _, _, next_val = model.act(next_obs)  # value is 3rd element
-
-                adv, returns = compute_gae(rew_buf, val_buf, next_val)
-                obs_arr  = np.stack(obs_buf)
-                act_arr  = np.array(act_buf,  dtype=np.int32)
-                logp_arr = np.array(logp_buf, dtype=np.float32)
-
-                for _ in range(PPO_EPOCHS):
-                    idx = np.random.permutation(BUFFER_SIZE)
-                    for s in range(0, BUFFER_SIZE, MINIBATCH):
-                        mb = idx[s:s + MINIBATCH]
-                        model.update(obs_arr[mb], act_arr[mb],
-                                     logp_arr[mb], returns[mb], adv[mb])
-
-                log.info(
-                    f'step={step:6d}  rew={ep_reward:+7.2f}  '
-                    f'safe={safety_count:2d}  green={green_count:2d}  nav={navigator.state_name:8s}  '
-                    f'us=({raw_L:5.1f},{raw_F:5.1f},{raw_R:5.1f})cm  '
-                    f'plant=({vf.plant_L:.2f},{vf.plant_C:.2f},{vf.plant_R:.2f})  '
-                    f'tree=({vf.tree_L:.2f},{vf.tree_C:.2f},{vf.tree_R:.2f})  '
-                    f'crop=({vf.crop_L:.2f},{vf.crop_R:.2f})  '
-                    f'free={vf.free_path_C:.2f}  cmd=({_CMD[lc][:3]},{_CMD[rc][:3]})'
-                )
-                model.save(CHECKPOINT)
-                obs_buf.clear(); act_buf.clear(); logp_buf.clear()
-                rew_buf.clear();  val_buf.clear()
-                ep_reward = 0.0;  safety_count = 0;  green_count = 0
-
-            # 9. Pace loop
-            _last_tick[0] = time.monotonic()
-            elapsed = time.monotonic() - t0
-            slack   = TIMESTEP_S - elapsed
-            if slack > 0:
-                time.sleep(slack)
-
+        model.learn(
+            total_timesteps     = 10_000_000,
+            callback            = callbacks,
+            reset_num_timesteps = False,
+            progress_bar        = False,
+        )
     finally:
         rover.stop_motors()
         rover.close()
         model.save(CHECKPOINT)
-        log.info(f'Shutdown after {step} steps. Weights saved -> {CHECKPOINT}')
+        log.info('Shutdown. Model saved.')
 
 
 if __name__ == '__main__':

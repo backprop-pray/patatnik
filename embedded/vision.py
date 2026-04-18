@@ -5,37 +5,37 @@ Provides:
   - YOLO-based object detection (plant, tree, hazard) every YOLO_PERIOD frames
     Runs in a background daemon thread so it never blocks the control loop.
   - OpenCV HSV crop-row segmentation every frame (fast, synchronous)
+  - Raw bounding boxes exposed via get_detections() for stream annotation
 
 All outputs normalised to [0, 1].
 """
 
+import logging
+import os
 import threading
+import time
 import numpy as np
 import cv2
 from typing import NamedTuple
 
-# ── Optional YOLO import ──────────────────────────────────────────────────────
 try:
     from ultralytics import YOLO as _YOLO
     _YOLO_AVAILABLE = True
 except ImportError:
     _YOLO_AVAILABLE = False
 
-# ── Detection config ──────────────────────────────────────────────────────────
-YOLO_PERIOD   = 5     # run YOLO every N camera frames (~3 fps at 15 fps stream)
-YOLO_CONF_THR = 0.30  # minimum detection confidence to consider
+YOLO_PERIOD      = 2      # run every N frames
+YOLO_CONF_THR    = 0.12
+PLANT_BBOX_THR   = 0.04   # bbox area / frame area threshold to save frame & trigger approach
+SAVE_FRAMES_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'saved_frames')
 
-# Image region boundaries (fraction of frame width)
 _L_END   = 1 / 3
 _R_START = 2 / 3
 
-# HSV range for green vegetation (crops / grass)
-# Tune lower/upper hue bounds for your specific field conditions.
-_HSV_LOWER = np.array([25,  40,  40], dtype=np.uint8)   # yellow-green
-_HSV_UPPER = np.array([85, 255, 255], dtype=np.uint8)   # green-cyan
+_HSV_LOWER = np.array([25,  40,  40], dtype=np.uint8)
+_HSV_UPPER = np.array([85, 255, 255], dtype=np.uint8)
 
 
-# ── Output type ───────────────────────────────────────────────────────────────
 class VisionFeatures(NamedTuple):
     plant_L:     float
     plant_C:     float
@@ -54,9 +54,7 @@ class VisionFeatures(NamedTuple):
 ZERO_VISION = VisionFeatures(*(0.0,) * 12)
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def _region(cx_norm: float) -> int:
-    """Map normalised horizontal centre → 0 (L), 1 (C), 2 (R)."""
     if cx_norm < _L_END:
         return 0
     if cx_norm < _R_START:
@@ -65,22 +63,16 @@ def _region(cx_norm: float) -> int:
 
 
 def _density(mask: np.ndarray) -> float:
-    """Fraction of non-zero pixels in a binary mask."""
     return float(mask.sum()) / (mask.size * 255 + 1e-6)
 
 
-# ── Pipeline class ────────────────────────────────────────────────────────────
 class VisionPipeline:
     """
     Thread-safe hybrid YOLO + OpenCV pipeline.
-
-    Usage:
-        vp = VisionPipeline()
-        ...
-        features = vp.update(frame_rgb)   # call once per control tick
+    Exposes raw bounding boxes via get_detections() for stream annotation.
     """
 
-    def __init__(self, model_path: str = 'yolov8n.pt'):
+    def __init__(self, model_path: str = 'yolo11n.pt'):
         self._frame_idx  = 0
         self._yolo_busy  = False
         self._lock       = threading.Lock()
@@ -89,45 +81,46 @@ class VisionPipeline:
             'tree':   [0.0, 0.0, 0.0],
             'hazard': [0.0, 0.0, 0.0],
         }
+        # list of (name, conf, x1, y1, x2, y2) in frame coords
+        self._last_detections      = []
+        self._last_det_frame_wh    = (640, 480)
+        self._max_plant_bbox_area  = 0.0   # largest plant bbox area fraction seen
 
         if _YOLO_AVAILABLE:
             self._model = _YOLO(model_path, verbose=False)
-            # Warm-up inference so the first real call isn't slow
             dummy = np.zeros((480, 640, 3), dtype=np.uint8)
             self._model.predict(dummy, verbose=False, conf=YOLO_CONF_THR)
         else:
             self._model = None
 
-    # ── Public entry point ────────────────────────────────────────────────────
-    def update(self, frame_rgb: np.ndarray) -> VisionFeatures:
-        """
-        frame_rgb : (H, W, 3) uint8 numpy array in RGB colour order.
-        Returns   : VisionFeatures namedtuple, all values in [0, 1].
-        """
-        self._frame_idx += 1
-        h, w = frame_rgb.shape[:2]
+    def get_detections(self):
+        """Returns (detections, frame_w, frame_h) thread-safely."""
+        with self._lock:
+            return list(self._last_detections), self._last_det_frame_wh[0], self._last_det_frame_wh[1]
 
-        # Kick off YOLO in background if it is time and the thread is free
+    def get_max_plant_bbox_area(self) -> float:
+        """Returns the largest plant bbox area fraction from the last YOLO run."""
+        with self._lock:
+            return self._max_plant_bbox_area
+
+    def update(self, frame_bgr: np.ndarray) -> VisionFeatures:
+        self._frame_idx += 1
+        h, w = frame_bgr.shape[:2]
+
         if (self._model is not None
                 and self._frame_idx % YOLO_PERIOD == 1
                 and not self._yolo_busy):
-            frame_copy = frame_rgb.copy()
-            t = threading.Thread(
-                target=self._run_yolo,
-                args=(frame_copy, w, h),
-                daemon=True,
-            )
+            frame_copy = frame_bgr.copy()
+            t = threading.Thread(target=self._run_yolo, args=(frame_copy, w, h), daemon=True)
             self._yolo_busy = True
             t.start()
 
-        # Read YOLO cache (thread-safe snapshot)
         with self._lock:
             ps = list(self._yolo_cache['plant'])
             ts = list(self._yolo_cache['tree'])
             hs = list(self._yolo_cache['hazard'])
 
-        # OpenCV runs synchronously — it is fast
-        crop_L, crop_R, free_C = self._run_opencv(frame_rgb, w, h)
+        crop_L, crop_R, free_C = self._run_opencv(frame_bgr, w, h)
 
         return VisionFeatures(
             plant_L=ps[0],  plant_C=ps[1],  plant_R=ps[2],
@@ -136,18 +129,28 @@ class VisionPipeline:
             crop_L=crop_L,  crop_R=crop_R,  free_path_C=free_C,
         )
 
-    # ── YOLO (background thread) ──────────────────────────────────────────────
-    def _run_yolo(self, frame_rgb: np.ndarray, w: int, h: int) -> None:
-        """Detect objects and update self._yolo_cache. Runs in daemon thread."""
+    def _run_yolo(self, frame_bgr: np.ndarray, w: int, h: int) -> None:
         try:
-            frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
-            results   = self._model.predict(
-                frame_bgr, verbose=False, conf=YOLO_CONF_THR,
-            )
+            # Frame is already BGR (PiCamera2 RGB888 returns BGR for this camera)
+            results = self._model.predict(frame_bgr, verbose=False, conf=YOLO_CONF_THR)
 
-            new_plant  = [0.0, 0.0, 0.0]
-            new_tree   = [0.0, 0.0, 0.0]
-            new_hazard = [0.0, 0.0, 0.0]
+            new_plant    = [0.0, 0.0, 0.0]
+            new_tree     = [0.0, 0.0, 0.0]
+            new_hazard   = [0.0, 0.0, 0.0]
+            new_dets     = []
+            new_max_bbox = 0.0
+
+            # Classes that must NOT trigger plant-approach/orchestration but are still
+            # shown on the stream overlay so the operator can see all detections.
+            _PLANT_SEND_KEYWORDS = frozenset({
+                'plant', 'flower', 'shrub', 'potted', 'vase',
+                'banana', 'apple', 'orange', 'broccoli', 'carrot',
+                'fruit', 'vegetable', 'crop', 'vine', 'leaf', 'grass',
+                'bush', 'weed', 'herb', 'tomato', 'lettuce', 'cabbage',
+                'celery', 'cucumber', 'pepper', 'pumpkin', 'squash',
+                'berry', 'cherry', 'grape', 'lemon', 'mango', 'melon',
+                'pear', 'pineapple', 'strawberry', 'watermelon', 'tree',
+            })
 
             for r in results:
                 if r.boxes is None:
@@ -156,55 +159,67 @@ class VisionPipeline:
                     name    = r.names[int(box.cls)].lower()
                     conf    = float(box.conf)
                     x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    cx_norm = ((x1 + x2) / 2.0) / w
-                    bh_norm = (y2 - y1) / h
-                    # Score combines detection confidence and object size
-                    score   = min(1.0, conf * bh_norm)
-                    reg     = _region(cx_norm)
+                    cx_norm   = ((x1 + x2) / 2.0) / w
+                    bh_norm   = (y2 - y1) / h
+                    bbox_area = ((x2 - x1) * (y2 - y1)) / (w * h + 1e-6)
+                    score     = min(1.0, conf * bh_norm)
+                    reg       = _region(cx_norm)
 
-                    # Rewardable: plant / tree
-                    if any(kw in name for kw in ('plant', 'flower', 'shrub', 'potted')):
+                    new_dets.append((name, conf, x1, y1, x2, y2))
+
+                    # All objects are recorded for stream display.
+                    # Only plants/vegetables/fruits affect plant scores and
+                    # therefore trigger the orchestration pipeline.
+                    is_plant = any(kw in name for kw in _PLANT_SEND_KEYWORDS)
+                    if is_plant:
                         new_plant[reg] = max(new_plant[reg], score)
+                        new_max_bbox   = max(new_max_bbox, bbox_area)
                     if 'tree' in name:
-                        new_tree[reg]  = max(new_tree[reg],  score)
-                        # Trees are also counted as plants (partial credit)
+                        new_tree[reg]  = max(new_tree[reg], score)
                         new_plant[reg] = max(new_plant[reg], score * 0.5)
-
-                    # Hazardous: person, furniture
-                    if any(kw in name for kw in ('shoe', 'chair', 'table', 'bench',
-                                                  'couch', 'sofa')):
+                        new_max_bbox   = max(new_max_bbox, bbox_area)
+                    if any(kw in name for kw in ('shoe', 'chair', 'table', 'bench', 'couch', 'sofa')):
                         new_hazard[reg] = max(new_hazard[reg], score)
 
+            # Save annotated frame if any plant bbox is large enough
+            if new_max_bbox >= PLANT_BBOX_THR:
+                try:
+                    os.makedirs(SAVE_FRAMES_DIR, exist_ok=True)
+                    annotated = frame_bgr.copy()
+                    for name, conf, x1, y1, x2, y2 in new_dets:
+                        if any(kw in name for kw in ('plant', 'potted', 'vase', 'tree', 'flower',
+                                                      'fruit', 'vegetable', 'banana', 'apple')):
+                            cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                            cv2.putText(annotated, f'{name} {conf:.2f}', (int(x1), int(y1) - 6),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    fname = os.path.join(SAVE_FRAMES_DIR, f'plant_{int(time.time()*1000)}.jpg')
+                    cv2.imwrite(fname, annotated)
+                except Exception as save_exc:
+                    logging.warning('Frame save failed: %s', save_exc)
+
             with self._lock:
-                self._yolo_cache['plant']  = new_plant
-                self._yolo_cache['tree']   = new_tree
-                self._yolo_cache['hazard'] = new_hazard
+                self._yolo_cache['plant']     = new_plant
+                self._yolo_cache['tree']      = new_tree
+                self._yolo_cache['hazard']    = new_hazard
+                self._last_detections         = new_dets
+                self._last_det_frame_wh       = (w, h)
+                self._max_plant_bbox_area     = new_max_bbox
+        except Exception as exc:
+            logging.error('YOLO thread error: %s', exc, exc_info=True)
         finally:
             self._yolo_busy = False
 
-    # ── OpenCV crop segmentation ──────────────────────────────────────────────
-    def _run_opencv(
-        self, frame_rgb: np.ndarray, w: int, h: int
-    ) -> tuple[float, float, float]:
-        """
-        HSV-threshold the bottom 60 % of the frame (ground plane).
-
-        Returns (crop_L, crop_R, free_path_C):
-          crop_L     — green-pixel density in left third   → crop presence
-          crop_R     — green-pixel density in right third  → crop presence
-          free_path_C — non-green density in centre strip  → open path ahead
-        """
-        # Restrict to ground plane (ignore sky / distant objects)
-        roi  = frame_rgb[int(h * 0.4):, :]
-        hsv  = cv2.cvtColor(roi, cv2.COLOR_RGB2HSV)
+    def _run_opencv(self, frame_bgr: np.ndarray, w: int, h: int) -> tuple[float, float, float]:
+        roi  = frame_bgr[int(h * 0.4):, :]
+        hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, _HSV_LOWER, _HSV_UPPER)
 
-        rw   = mask.shape[1]
-        l    = rw // 3
-        r    = 2 * rw // 3
+        rw = mask.shape[1]
+        l  = rw // 3
+        r  = 2 * rw // 3
 
-        crop_L     = min(1.0, _density(mask[:, :l]))
-        crop_R     = min(1.0, _density(mask[:, r:]))
+        crop_L      = min(1.0, _density(mask[:, :l]))
+        crop_R      = min(1.0, _density(mask[:, r:]))
         free_path_C = max(0.0, 1.0 - _density(mask[:, l:r]))
 
         return crop_L, crop_R, free_path_C

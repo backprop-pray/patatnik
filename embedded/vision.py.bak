@@ -1,0 +1,222 @@
+"""
+vision.py — Lightweight hybrid vision pipeline for the patatnik rover.
+
+Provides:
+  - YOLO-based object detection (plant, tree, hazard) every YOLO_PERIOD frames
+    Runs in a background daemon thread so it never blocks the control loop.
+  - OpenCV HSV crop-row segmentation every frame (fast, synchronous)
+  - Raw bounding boxes exposed via get_detections() for stream annotation
+
+All outputs normalised to [0, 1].
+"""
+
+import logging
+import os
+import threading
+import time
+import numpy as np
+import cv2
+from typing import NamedTuple
+
+try:
+    from ultralytics import YOLO as _YOLO
+    _YOLO_AVAILABLE = True
+except ImportError:
+    _YOLO_AVAILABLE = False
+
+YOLO_PERIOD      = 2      # run every N frames
+YOLO_CONF_THR    = 0.12
+PLANT_BBOX_THR   = 0.04   # bbox area / frame area threshold to save frame & trigger approach
+SAVE_FRAMES_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'saved_frames')
+
+_L_END   = 1 / 3
+_R_START = 2 / 3
+
+_HSV_LOWER = np.array([25,  40,  40], dtype=np.uint8)
+_HSV_UPPER = np.array([85, 255, 255], dtype=np.uint8)
+
+
+class VisionFeatures(NamedTuple):
+    plant_L:     float
+    plant_C:     float
+    plant_R:     float
+    tree_L:      float
+    tree_C:      float
+    tree_R:      float
+    hazard_L:    float
+    hazard_C:    float
+    hazard_R:    float
+    crop_L:      float
+    crop_R:      float
+    free_path_C: float
+
+
+ZERO_VISION = VisionFeatures(*(0.0,) * 12)
+
+
+def _region(cx_norm: float) -> int:
+    if cx_norm < _L_END:
+        return 0
+    if cx_norm < _R_START:
+        return 1
+    return 2
+
+
+def _density(mask: np.ndarray) -> float:
+    return float(mask.sum()) / (mask.size * 255 + 1e-6)
+
+
+class VisionPipeline:
+    """
+    Thread-safe hybrid YOLO + OpenCV pipeline.
+    Exposes raw bounding boxes via get_detections() for stream annotation.
+    """
+
+    def __init__(self, model_path: str = 'yolo11n.pt'):
+        self._frame_idx  = 0
+        self._yolo_busy  = False
+        self._lock       = threading.Lock()
+        self._yolo_cache = {
+            'plant':  [0.0, 0.0, 0.0],
+            'tree':   [0.0, 0.0, 0.0],
+            'hazard': [0.0, 0.0, 0.0],
+        }
+        # list of (name, conf, x1, y1, x2, y2) in frame coords
+        self._last_detections      = []
+        self._last_det_frame_wh    = (640, 480)
+        self._max_plant_bbox_area  = 0.0   # largest plant bbox area fraction seen
+
+        if _YOLO_AVAILABLE:
+            self._model = _YOLO(model_path, verbose=False)
+            dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+            self._model.predict(dummy, verbose=False, conf=YOLO_CONF_THR)
+        else:
+            self._model = None
+
+    def get_detections(self):
+        """Returns (detections, frame_w, frame_h) thread-safely."""
+        with self._lock:
+            return list(self._last_detections), self._last_det_frame_wh[0], self._last_det_frame_wh[1]
+
+    def get_max_plant_bbox_area(self) -> float:
+        """Returns the largest plant bbox area fraction from the last YOLO run."""
+        with self._lock:
+            return self._max_plant_bbox_area
+
+    def update(self, frame_bgr: np.ndarray) -> VisionFeatures:
+        self._frame_idx += 1
+        h, w = frame_bgr.shape[:2]
+
+        if (self._model is not None
+                and self._frame_idx % YOLO_PERIOD == 1
+                and not self._yolo_busy):
+            frame_copy = frame_bgr.copy()
+            t = threading.Thread(target=self._run_yolo, args=(frame_copy, w, h), daemon=True)
+            self._yolo_busy = True
+            t.start()
+
+        with self._lock:
+            ps = list(self._yolo_cache['plant'])
+            ts = list(self._yolo_cache['tree'])
+            hs = list(self._yolo_cache['hazard'])
+
+        crop_L, crop_R, free_C = self._run_opencv(frame_bgr, w, h)
+
+        return VisionFeatures(
+            plant_L=ps[0],  plant_C=ps[1],  plant_R=ps[2],
+            tree_L=ts[0],   tree_C=ts[1],   tree_R=ts[2],
+            hazard_L=hs[0], hazard_C=hs[1], hazard_R=hs[2],
+            crop_L=crop_L,  crop_R=crop_R,  free_path_C=free_C,
+        )
+
+    def _run_yolo(self, frame_bgr: np.ndarray, w: int, h: int) -> None:
+        try:
+            # Frame is already BGR (PiCamera2 RGB888 returns BGR for this camera)
+            results = self._model.predict(frame_bgr, verbose=False, conf=YOLO_CONF_THR)
+
+            new_plant    = [0.0, 0.0, 0.0]
+            new_tree     = [0.0, 0.0, 0.0]
+            new_hazard   = [0.0, 0.0, 0.0]
+            new_dets     = []
+            new_max_bbox = 0.0
+
+            _SKIP_CLASSES = frozenset({'person', 'bicycle', 'motorcycle', 'car', 'truck', 'bus'})
+
+            for r in results:
+                if r.boxes is None:
+                    continue
+                for box in r.boxes:
+                    name    = r.names[int(box.cls)].lower()
+                    if name in _SKIP_CLASSES:
+                        continue
+                    conf    = float(box.conf)
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+                    cx_norm   = ((x1 + x2) / 2.0) / w
+                    bh_norm   = (y2 - y1) / h
+                    bbox_area = ((x2 - x1) * (y2 - y1)) / (w * h + 1e-6)
+                    score     = min(1.0, conf * bh_norm)
+                    reg       = _region(cx_norm)
+
+                    new_dets.append((name, conf, x1, y1, x2, y2))
+
+                    is_plant = any(kw in name for kw in (
+                        'plant', 'flower', 'shrub', 'potted', 'vase',
+                        'banana', 'apple', 'orange', 'broccoli', 'carrot',
+                        'fruit', 'vegetable', 'crop', 'vine', 'leaf', 'grass',
+                        'bush', 'weed', 'herb', 'tomato', 'lettuce', 'cabbage',
+                        'celery', 'cucumber', 'pepper', 'pumpkin', 'squash',
+                        'berry', 'cherry', 'grape', 'lemon', 'mango', 'melon',
+                        'pear', 'pineapple', 'strawberry', 'watermelon',
+                    ))
+                    if is_plant:
+                        new_plant[reg] = max(new_plant[reg], score)
+                        new_max_bbox   = max(new_max_bbox, bbox_area)
+                    if 'tree' in name:
+                        new_tree[reg]  = max(new_tree[reg], score)
+                        new_plant[reg] = max(new_plant[reg], score * 0.5)
+                        new_max_bbox   = max(new_max_bbox, bbox_area)
+                    if any(kw in name for kw in ('shoe', 'chair', 'table', 'bench', 'couch', 'sofa')):
+                        new_hazard[reg] = max(new_hazard[reg], score)
+
+            # Save annotated frame if any plant bbox is large enough
+            if new_max_bbox >= PLANT_BBOX_THR:
+                try:
+                    os.makedirs(SAVE_FRAMES_DIR, exist_ok=True)
+                    annotated = frame_bgr.copy()
+                    for name, conf, x1, y1, x2, y2 in new_dets:
+                        if any(kw in name for kw in ('plant', 'potted', 'vase', 'tree', 'flower',
+                                                      'fruit', 'vegetable', 'banana', 'apple')):
+                            cv2.rectangle(annotated, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                            cv2.putText(annotated, f'{name} {conf:.2f}', (int(x1), int(y1) - 6),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+                    fname = os.path.join(SAVE_FRAMES_DIR, f'plant_{int(time.time()*1000)}.jpg')
+                    cv2.imwrite(fname, annotated)
+                except Exception as save_exc:
+                    logging.warning('Frame save failed: %s', save_exc)
+
+            with self._lock:
+                self._yolo_cache['plant']     = new_plant
+                self._yolo_cache['tree']      = new_tree
+                self._yolo_cache['hazard']    = new_hazard
+                self._last_detections         = new_dets
+                self._last_det_frame_wh       = (w, h)
+                self._max_plant_bbox_area     = new_max_bbox
+        except Exception as exc:
+            logging.error('YOLO thread error: %s', exc, exc_info=True)
+        finally:
+            self._yolo_busy = False
+
+    def _run_opencv(self, frame_bgr: np.ndarray, w: int, h: int) -> tuple[float, float, float]:
+        roi  = frame_bgr[int(h * 0.4):, :]
+        hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        mask = cv2.inRange(hsv, _HSV_LOWER, _HSV_UPPER)
+
+        rw = mask.shape[1]
+        l  = rw // 3
+        r  = 2 * rw // 3
+
+        crop_L      = min(1.0, _density(mask[:, :l]))
+        crop_R      = min(1.0, _density(mask[:, r:]))
+        free_path_C = max(0.0, 1.0 - _density(mask[:, l:r]))
+
+        return crop_L, crop_R, free_path_C
